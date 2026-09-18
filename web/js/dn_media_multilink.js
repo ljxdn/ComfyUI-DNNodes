@@ -280,7 +280,7 @@ function virtualLinkHandles(canvas, toScreen) {
                 x: screen[0],
                 y: screen[1],
                 size: HANDLE_SIZE,
-                title: `第 ${index + 1} 条连线（右键：上移 / 下移 / 删除）`,
+                title: `第 ${index + 1} 条连线（右键：序号提前 / 序号退后 / 删除）`,
                 onActivate: open,
                 onMenu: open,
             });
@@ -377,8 +377,8 @@ function openLinkMenu(canvas, hit, event) {
         const count = normalizeLinks(hit.targetNode).length;
         const items = [];
         if (count > 1) {
-            items.push({ content: "上移一位（编号提前）", callback: run(() => moveVirtualLink(hit.targetNode, hit.index, -1)) });
-            items.push({ content: "下移一位（编号推后）", callback: run(() => moveVirtualLink(hit.targetNode, hit.index, +1)) });
+            items.push({ content: "序号提前", callback: run(() => moveVirtualLink(hit.targetNode, hit.index, -1)) });
+            items.push({ content: "序号退后", callback: run(() => moveVirtualLink(hit.targetNode, hit.index, +1)) });
             items.push(null);
         }
         items.push({ content: "删除这条连线", callback: run(() => removeVirtualLink(hit.targetNode, hit.index)) });
