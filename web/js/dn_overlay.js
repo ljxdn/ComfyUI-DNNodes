@@ -20,8 +20,58 @@
 const LAYER_ID = "dn-highlight-overlay";
 const Z_INDEX = 5;              // 高于 .isolate 里的 DOM 控件(z-index:0)，低于 comfy-menu(999)/tooltip(99999)
 
-/** 登记到覆盖层的绘制函数（同名只登记一次）。 */
+/** 登记到覆盖层的绘制函数（同名只登记一次）。
+ *  value = { fn, priority, order }；绘制时**按 priority 升序**（同优先级按登记先后），
+ *  也就是 priority 越大的越晚画、越靠上。
+ *  为什么要显式优先级：金色高亮和连线圆点是两个扩展各自登记的，而 ComfyUI 是
+ *  **并行 import** 所有扩展脚本（文件小、编译快的先执行），所以「谁后画」本来是随机的 ——
+ *  高亮线的 8px 外发光会把中点的序号圆点糊掉。用优先级把它钉死。 */
 const painters = new Map();
+let painterSeq = 0;
+
+/** 画在最上层的优先级（用于「必须压过金色高亮」的东西，如连线中点的序号圆点）。 */
+export const PAINTER_TOP = 100;
+
+/* ------------------------------------------------------------------
+ * 共享绘制件：虚拟连线中点的「序号圆点」
+ * 几何与配色只在这里定义一次，避免多处各写一套导致大小/字体对不上。
+ * ------------------------------------------------------------------ */
+export const VIRTUAL_DOT = {
+    radius: 11,               // 半径（原来是 8，用户反馈太小）
+    ringWidth: 2.5,           // 深色描边：把圆点从金色发光的背景里"抠"出来
+    fill: "#34d399",
+    ring: "#071510",
+    text: "#071510",
+    font: "bold 12px Arial",
+};
+
+/** 在 (x, y) 画一个带序号的圆点。坐标 = 画布坐标。 */
+export function drawVirtualDot(ctx, x, y, label) {
+    if (!ctx || !Number.isFinite(x) || !Number.isFinite(y)) return;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(x, y, VIRTUAL_DOT.radius, 0, Math.PI * 2);
+    ctx.fillStyle = VIRTUAL_DOT.fill;
+    ctx.fill();
+    if (VIRTUAL_DOT.ringWidth > 0) {
+        ctx.lineWidth = VIRTUAL_DOT.ringWidth;
+        ctx.strokeStyle = VIRTUAL_DOT.ring;
+        ctx.stroke();
+    }
+    ctx.fillStyle = VIRTUAL_DOT.text;
+    ctx.font = VIRTUAL_DOT.font;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(String(label), x, y);
+    ctx.restore();
+}
+
+/** 按优先级排好序的绘制函数列表。 */
+function orderedPainters() {
+    const list = Array.from(painters.values());
+    list.sort((a, b) => (a.priority - b.priority) || (a.order - b.order));
+    return list;
+}
 
 /** 登记「可点击把手」的提供者（同名只登记一次）。
  *  为什么要 DOM 把手：线中点画在覆盖层上是**看得见**了，但覆盖层 pointer-events:none，
@@ -107,9 +157,9 @@ function repaint(canvas) {
     const k = scale * ratio;
     ctx.setTransform(k, 0, 0, k, offset[0] * k, offset[1] * k);
     ctx.save();
-    for (const fn of painters.values()) {
+    for (const rec of orderedPainters()) {
         try {
-            fn(ctx, canvas);
+            rec.fn(ctx, canvas);
         } catch (error) {
             console.warn("[DN overlay] painter failed:", error);
         }
@@ -270,10 +320,11 @@ function ensureHooked() {
 }
 
 /** 登记一个「需要画在节点/DOM 控件之上」的绘制函数。
- *  @param name  唯一名字（重复登记会覆盖，便于热刷新）
- *  @param fn    (ctx, canvas) => void，坐标 = 画布坐标（与画布上正常绘制一致） */
-export function addForegroundPainter(name, fn) {
-    painters.set(name, fn);
+ *  @param name      唯一名字（重复登记会覆盖，便于热刷新）
+ *  @param fn        (ctx, canvas) => void，坐标 = 画布坐标（与画布上正常绘制一致）
+ *  @param priority  越大越晚画、越靠上（默认 0；要用 :data:`PAINTER_TOP` 压过高亮层） */
+export function addForegroundPainter(name, fn, priority = 0) {
+    painters.set(name, { fn, priority: Number(priority) || 0, order: ++painterSeq });
     ensureHooked();
     return fn;
 }
@@ -287,3 +338,6 @@ export function removeForegroundPainter(name) {
 globalThis.__dnOverlay = globalThis.__dnOverlay || { paints: 0 };
 globalThis.__dnOverlay.layerId = LAYER_ID;
 globalThis.__dnOverlay.painterCount = () => painters.size;
+/** 探针用：当前登记的绘制函数与它们的优先级（按绘制顺序）。 */
+globalThis.__dnOverlay.painters = () => orderedPainters().map((rec) => rec.priority);
+globalThis.__dnOverlay.painterNames = () => Array.from(painters.keys());

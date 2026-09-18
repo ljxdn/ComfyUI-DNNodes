@@ -1,5 +1,5 @@
 import { app } from "../../../scripts/app.js";
-import { addForegroundPainter, addHandleProvider } from "./dn_overlay.js";
+import { addForegroundPainter, addHandleProvider, drawVirtualDot, PAINTER_TOP } from "./dn_overlay.js";
 
 /*
  * 资产卡 to Director Group —— medias 单端口多连线。
@@ -22,6 +22,11 @@ const MEDIA_INPUT = "medias";
 const BACKING_RE = /^media_[1-9]$/;
 const MAX_MEDIA = 9;
 const LINKS_PROPERTY = "dn_media_to_group_links";
+
+/* 中点圆点的可点范围与透明把手的边长：圆点半径见 dn_overlay.js 的 VIRTUAL_DOT.radius（11）。
+   两者比圆点本身大一圈，方便点。 */
+const DOT_HIT_RADIUS = 20;
+const HANDLE_SIZE = 40;
 
 /** 返回该节点的虚拟媒体连接记录（数组即顺序）。 */
 function getLinks(node) {
@@ -187,11 +192,15 @@ function isNodeSelected(canvas, node) {
 
 /** 绘制虚拟媒体连线和顺序序号。
  *  `options.selectedOnly` = true 时只画「目标节点处于选中状态」的连线 ——
- *  用于把它们补画到**节点层之上**（否则线中点会被别的节点压住，右键点不到）。 */
+ *  用于把它们补画到**节点层之上**（否则线中点会被别的节点压住，右键点不到）。
+ *  `options.linesOnly` / `options.dotsOnly` 把「线」和「中点圆点」拆成两层画，
+ *  圆点单独用高优先级登记到覆盖层最上层（否则会被选中时的高亮外发光糊掉）。 */
 function drawVirtualLinks(canvas, ctx, options) {
     const graph = canvas?.graph || app.graph;
     if (!ctx || !graph?._nodes || canvas.links_render_mode === globalThis.LiteGraph?.HIDDEN_LINK) return;
     const selectedOnly = !!options?.selectedOnly;
+    const linesOnly = !!options?.linesOnly;
+    const dotsOnly = !!options?.dotsOnly;
     for (const target of graph._nodes) {
         if (target?.comfyClass !== NODE_CLASS && target?.type !== NODE_CLASS) continue;
         if (selectedOnly && !isNodeSelected(canvas, target)) continue;
@@ -203,23 +212,17 @@ function drawVirtualLinks(canvas, ctx, options) {
             if (!sourceNode || !sourcePoint) continue;
             const midX = (sourcePoint[0] + targetPoint[0]) / 2;
             const midY = (sourcePoint[1] + targetPoint[1]) / 2;
-            ctx.save();
-            ctx.beginPath();
-            ctx.moveTo(sourcePoint[0], sourcePoint[1]);
-            ctx.bezierCurveTo(sourcePoint[0] + 80, sourcePoint[1], targetPoint[0] - 80, targetPoint[1], targetPoint[0], targetPoint[1]);
-            ctx.lineWidth = canvas.connections_width || 3;
-            ctx.strokeStyle = globalThis.LGraphCanvas?.link_type_colors?.H3_MEDIA || "#34d399";
-            ctx.stroke();
-            ctx.beginPath();
-            ctx.arc(midX, midY, 8, 0, Math.PI * 2);
-            ctx.fillStyle = "#34d399";
-            ctx.fill();
-            ctx.fillStyle = "#071510";
-            ctx.font = "bold 10px Arial";
-            ctx.textAlign = "center";
-            ctx.textBaseline = "middle";
-            ctx.fillText(String(index + 1), midX, midY);
-            ctx.restore();
+            if (!dotsOnly) {
+                ctx.save();
+                ctx.beginPath();
+                ctx.moveTo(sourcePoint[0], sourcePoint[1]);
+                ctx.bezierCurveTo(sourcePoint[0] + 80, sourcePoint[1], targetPoint[0] - 80, targetPoint[1], targetPoint[0], targetPoint[1]);
+                ctx.lineWidth = canvas.connections_width || 3;
+                ctx.strokeStyle = globalThis.LGraphCanvas?.link_type_colors?.H3_MEDIA || "#34d399";
+                ctx.stroke();
+                ctx.restore();
+            }
+            if (!linesOnly) drawVirtualDot(ctx, midX, midY, index + 1);
         }
     }
 }
@@ -276,7 +279,7 @@ function virtualLinkHandles(canvas, toScreen) {
                 key: `${target.id}:${index}`,
                 x: screen[0],
                 y: screen[1],
-                size: 34,
+                size: HANDLE_SIZE,
                 title: `第 ${index + 1} 条连线（右键：上移 / 下移 / 删除）`,
                 onActivate: open,
                 onMenu: open,
@@ -299,7 +302,7 @@ function hitTestVirtualLinks(graph, x, y) {
             if (!sourceNode || !sourcePoint) return;
             const mid = [(sourcePoint[0] + targetPoint[0]) / 2, (sourcePoint[1] + targetPoint[1]) / 2];
             const distance = Math.hypot(x - mid[0], y - mid[1]);
-            if (distance <= 18 && (!best || distance < best.distance)) {
+            if (distance <= DOT_HIT_RADIUS && (!best || distance < best.distance)) {
                 best = { targetNode, index, point: mid, distance };
             }
         });
@@ -419,8 +422,13 @@ function patchCanvas() {
     // canvas 上画的线永远压在它们下面（实测资产卡节点会盖住线中点）。
     // 所以再登记一份到 DOM 覆盖层 —— 同一套绘制函数，坐标也一样，只是画到了另一张画布。
     addForegroundPainter("dn.multilink.selected", (ctx, mainCanvas) => {
-        drawVirtualLinks(mainCanvas, ctx, { selectedOnly: true });
+        drawVirtualLinks(mainCanvas, ctx, { selectedOnly: true, linesOnly: true });
     });
+    // 中点圆点单独一层，用最高优先级 —— 它必须压在**选中时的金色高亮**之上，
+    // 否则高亮线 8px 的外发光会把序号糊掉（用户实测反馈）。
+    addForegroundPainter("dn.multilink.dots", (ctx, mainCanvas) => {
+        drawVirtualLinks(mainCanvas, ctx, { selectedOnly: true, dotsOnly: true });
+    }, PAINTER_TOP);
     // 看得见还不够，还得点得到：给每个中点挂透明 DOM 把手（在自绘 UI 之上）。
     addHandleProvider("dn.multilink.handles", virtualLinkHandles);
     const originalDown = canvas.processMouseDown;

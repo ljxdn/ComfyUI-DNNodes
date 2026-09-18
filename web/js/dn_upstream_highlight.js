@@ -1,5 +1,5 @@
 import { app } from "../../../scripts/app.js";
-import { addForegroundPainter } from "./dn_overlay.js";
+import { addForegroundPainter, drawVirtualDot, PAINTER_TOP } from "./dn_overlay.js";
 
 /*
  * DN 节点「选中即高亮上游」。
@@ -37,7 +37,6 @@ const HOP_LIMIT = 1;
 const COLOR = "#f5b942";
 const COLOR_SOFT = "rgba(245, 185, 66, 0.28)";
 const RING_PAD = 4;
-const VIRTUAL_DOT_R = 8;
 
 /** 是否是媒体输入名（medias / media_1..9）。 */
 function isMediaInputName(name) {
@@ -202,41 +201,41 @@ function strokeLink(ctx, from, to) {
     ctx.restore();
 }
 
-/** 虚拟连线中点序号圆点：高亮层叠上去会把它糊掉，这里原样补画一次。 */
-function redrawVirtualDot(ctx, from, to, index) {
-    const midX = (from[0] + to[0]) / 2;
-    const midY = (from[1] + to[1]) / 2;
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(midX, midY, VIRTUAL_DOT_R, 0, Math.PI * 2);
-    ctx.fillStyle = "#34d399";
-    ctx.fill();
-    ctx.fillStyle = "#071510";
-    ctx.font = "bold 10px Arial";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(String(index), midX, midY);
-    ctx.restore();
-}
-
-/** 高亮连线层（画在节点下方，与已有连线同层）。 */
+/** 高亮连线层（画在节点下方，与已有连线同层）。只画线 —— 中点的序号圆点
+ *  由 drawVirtualDots() 单独一层、且画在**最上层**（高亮之后再画）。 */
 function drawLinkHighlight(ctx) {
     const targets = selectedTargets();
     if (!targets.length) return;
     const { links } = collectUpstream(targets);
     if (!links.length) return;
-    const virtualOrder = new Map();
-    for (const item of links) {
-        if (!item.virtual) continue;
-        const key = item.toNode?.id;
-        virtualOrder.set(key, (virtualOrder.get(key) || 0) + 1);
-        item.order = virtualOrder.get(key);
-    }
     for (const item of links) {
         const from = outputPos(item.fromNode, item.fromSlot);
         const to = item.virtual ? mediaPortPos(item.toNode) : inputPos(item.toNode, mediaInputIndex(item.toNode));
         strokeLink(ctx, from, to);
-        if (item.virtual && from && to) redrawVirtualDot(ctx, from, to, item.order);
+    }
+}
+
+/** 虚拟连线中点的序号圆点：**单独一层、最高优先级**。
+ *
+ *  为什么要拆出来：高亮线画的是 8px 半透明外发光 + 3px 实线，会糊掉压在同一位置的圆点；
+ *  而两个扩展是并行加载的，绘制顺序本来不确定（谁文件小谁先执行），
+ *  靠登记顺序碰运气不靠谱 → 用覆盖层的 PAINTER_TOP 把「点在金线之上」钉死。
+ *  几何/配色统一走 dn_overlay 的共享绘制件，和 dn_media_multilink 画出来的一模一样。 */
+function drawVirtualDots(ctx) {
+    const targets = selectedTargets();
+    if (!targets.length) return;
+    const { links } = collectUpstream(targets);
+    if (!links.length) return;
+    const seen = new Map();
+    for (const item of links) {
+        if (!item.virtual) continue;
+        const key = item.toNode?.id;
+        const order = (seen.get(key) || 0) + 1;
+        seen.set(key, order);
+        const from = outputPos(item.fromNode, item.fromSlot);
+        const to = mediaPortPos(item.toNode);
+        if (!from || !to) continue;
+        drawVirtualDot(ctx, (from[0] + to[0]) / 2, (from[1] + to[1]) / 2, order);
     }
 }
 
@@ -321,6 +320,10 @@ function patchCanvas() {
     addForegroundPainter("dn.highlight.links", (ctx) => {
         drawLinkHighlight(ctx);
     });
+    // 序号圆点：最高优先级 —— 必须画在金色高亮之上（详见 drawVirtualDots 的说明）
+    addForegroundPainter("dn.highlight.dots", (ctx) => {
+        drawVirtualDots(ctx);
+    }, PAINTER_TOP);
     addForegroundPainter("dn.highlight.rings", (ctx) => {
         drawNodeRings(ctx);
     });
