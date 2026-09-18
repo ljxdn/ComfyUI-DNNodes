@@ -245,6 +245,18 @@ function mediaInputIndex(node) {
     return index < 0 ? 0 : index;
 }
 
+/** 节点视觉框的**顶边在 `pos.y` 之上**：这版前端把标题栏画在 `pos.y - NODE_TITLE_HEIGHT` 那一段
+ *  （`pos.y` 是「节点体」的顶边，标题栏占其上方 30px；分隔线正好落在 `pos.y` 上）。
+ *
+ *  实测依据（别改成 pos[1] 直接减 pad）：沿节点中轴逐像素扫描主画布 ——
+ *    dy = -30..-1 → (51,51,51) 标题栏色块（整整 30px）；dy = 0 → (42,42,42) 分隔线；dy ≥ 1 → (53,53,53) 节点体。
+ *  不补这一段，金色描边就会「包不住顶上那块标题」（用户报的现象）。
+ *  常量在并行 import 期间可能还没挂上，所以**每次都惰性读**，并留一个 30 的兜底。 */
+function titleHeight() {
+    const v = Number(globalThis.LiteGraph?.NODE_TITLE_HEIGHT);
+    return Number.isFinite(v) && v > 0 ? v : 30;
+}
+
 /** 高亮节点描边层（画在节点之上，所以边框不会被节点本身盖住）。 */
 function drawNodeRings(ctx) {
     const targets = selectedTargets();
@@ -253,15 +265,18 @@ function drawNodeRings(ctx) {
     if (!nodes.size) return;
     const scale = app?.canvas?.ds?.scale || 1;
     const lineWidth = 2.5 / scale;
+    const th = titleHeight();
     ctx.save();
     for (const { node } of nodes.values()) {
         const pos = node?.pos;
         const size = node?.size;
         if (!pos || !size) continue;
+        // 收起（collapsed）时只画标题那一条，不套用原来的 size[1]（会拖出一条空框）
+        const bodyH = node?.flags?.collapsed ? 0 : size[1];
         const x = pos[0] - RING_PAD;
-        const y = pos[1] - RING_PAD;
+        const y = pos[1] - th - RING_PAD;
         const w = size[0] + RING_PAD * 2;
-        const h = size[1] + RING_PAD * 2;
+        const h = bodyH + th + RING_PAD * 2;
         ctx.beginPath();
         const r = 8 / scale;
         ctx.moveTo(x + r, y);
