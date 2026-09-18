@@ -1,5 +1,5 @@
 import { app } from "../../../scripts/app.js";
-import { addForegroundPainter } from "./dn_overlay.js";
+import { addForegroundPainter, addHandleProvider } from "./dn_overlay.js";
 
 /*
  * 资产卡 to Director Group —— medias 单端口多连线。
@@ -251,6 +251,41 @@ function getClientPosition(canvas, point) {
     return { x: rect.left + (point[0] + offset[0]) * scale, y: rect.top + (point[1] + offset[1]) * scale };
 }
 
+/** 选中 DN 节点时，给每条虚拟连线的中点挂一个**透明 DOM 把手**。
+ *
+ *  为什么光有覆盖层绘制不够：线在覆盖层上是看得见了，但覆盖层 pointer-events:none，
+ *  真正吃到点击的是它下面那个节点自绘 UI（真 DOM 元素）→ 点线中点反而选中了节点（用户实测报过）。
+ *  把手是 DOM 元素，天然在自绘 UI 之上，点击就是它的；坐标用 toScreen 从画布坐标换算。 */
+function virtualLinkHandles(canvas, toScreen) {
+    const graph = canvas?.graph || app.graph;
+    if (!graph?._nodes) return [];
+    const out = [];
+    for (const target of graph._nodes) {
+        if (target?.comfyClass !== NODE_CLASS && target?.type !== NODE_CLASS) continue;
+        if (!isNodeSelected(canvas, target)) continue;
+        const targetPoint = getMediaPosition(target);
+        if (!targetPoint) continue;
+        normalizeLinks(target).forEach((item, index) => {
+            const sourceNode = getNode(graph, item.source_id);
+            const sourcePoint = getOutputPosition(sourceNode, Number(item.source_slot));
+            if (!sourceNode || !sourcePoint) return;
+            const mid = [(sourcePoint[0] + targetPoint[0]) / 2, (sourcePoint[1] + targetPoint[1]) / 2];
+            const screen = toScreen(mid);
+            const open = (event) => openLinkMenu(canvas, { targetNode: target, index, point: mid }, event);
+            out.push({
+                key: `${target.id}:${index}`,
+                x: screen[0],
+                y: screen[1],
+                size: 34,
+                title: `第 ${index + 1} 条连线（右键：上移 / 下移 / 删除）`,
+                onActivate: open,
+                onMenu: open,
+            });
+        });
+    }
+    return out;
+}
+
 /** 查找鼠标位置最近的虚拟连线。 */
 function hitTestVirtualLinks(graph, x, y) {
     let best = null;
@@ -386,6 +421,8 @@ function patchCanvas() {
     addForegroundPainter("dn.multilink.selected", (ctx, mainCanvas) => {
         drawVirtualLinks(mainCanvas, ctx, { selectedOnly: true });
     });
+    // 看得见还不够，还得点得到：给每个中点挂透明 DOM 把手（在自绘 UI 之上）。
+    addHandleProvider("dn.multilink.handles", virtualLinkHandles);
     const originalDown = canvas.processMouseDown;
     canvas.processMouseDown = function (event) {
         if (!isConnectingMedia(this)) {

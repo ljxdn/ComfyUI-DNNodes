@@ -23,6 +23,14 @@ const Z_INDEX = 5;              // 高于 .isolate 里的 DOM 控件(z-index:0)�
 /** 登记到覆盖层的绘制函数（同名只登记一次）。 */
 const painters = new Map();
 
+/** 登记「可点击把手」的提供者（同名只登记一次）。
+ *  为什么要 DOM 把手：线中点画在覆盖层上是**看得见**了，但覆盖层 pointer-events:none，
+ *  真正吃到点击的是它下面那个节点自绘 UI（真 DOM 元素）—— 于是点线中点反而选中了节点。
+ *  这里给每个可见的点挂一个透明 DOM 元素，它天然在 DOM 控件之上，点击就是它的。 */
+const handleProviders = new Map();
+const handlePool = new Map();
+const HANDLE_Z_INDEX = Z_INDEX + 1;
+
 /** 取主画布所在容器（DOM 控件与主画布的共同父层）。 */
 function getContainer(canvas) {
     const main = canvas?.canvas;
@@ -83,7 +91,7 @@ function repaint(canvas) {
     if (!main || !main.isConnected) return;
     const layer = ensureLayer(canvas);
     if (!layer) return;
-    if (!painters.size) return;
+    if (!painters.size && !handleProviders.size) return;
 
     const ratio = syncSize(layer, main);
     const ctx = layer.getContext("2d");
@@ -114,6 +122,106 @@ function repaint(canvas) {
         dbg.lastSize = [layer.width, layer.height];
         dbg.lastTransform = [k, offset[0] * k, offset[1] * k];
     }
+
+    syncHandles(canvas, ratio);
+}
+
+/* ------------------------------------------------------------------
+ * 可点击把手（透明 DOM 元素，压在节点自绘 UI 之上）
+ * ------------------------------------------------------------------ */
+
+/** 收集所有提供者给的把手，增量同步到 DOM。 */
+function syncHandles(canvas, ratio) {
+    const layer = document.getElementById(LAYER_ID);
+    const container = layer?.parentElement;
+    if (!container) return;
+    const ds = canvas?.ds || { scale: 1, offset: [0, 0] };
+    const scale = Number(ds.scale) || 1;
+    const offset = ds.offset || [0, 0];
+    // 画布坐标 → 容器内 CSS 像素（与主画布同一套换算：(g + offset) * scale）
+    const toScreen = (point) => [
+        (Number(point?.[0]) + offset[0]) * scale,
+        (Number(point?.[1]) + offset[1]) * scale,
+    ];
+
+    const list = [];
+    for (const fn of handleProviders.values()) {
+        try {
+            const out = fn(canvas, toScreen);
+            if (Array.isArray(out)) list.push(...out);
+        } catch (error) {
+            console.warn("[DN overlay] handle provider failed:", error);
+        }
+    }
+
+    const seen = new Set();
+    for (const item of list) {
+        if (!item || item.key == null) continue;
+        const key = String(item.key);
+        seen.add(key);
+        let rec = handlePool.get(key);
+        if (!rec) {
+            const el = document.createElement("div");
+            el.className = "dn-link-handle";
+            el.dataset.dnHandle = key;
+            el.style.position = "absolute";
+            el.style.background = "transparent";
+            el.style.pointerEvents = "auto";
+            el.style.cursor = "pointer";
+            el.style.zIndex = String(HANDLE_Z_INDEX);
+            container.append(el);
+            rec = { el };
+            handlePool.set(key, rec);
+        }
+        rec.data = item;
+        const size = Number(item.size) || 34;
+        rec.el.style.width = `${size}px`;
+        rec.el.style.height = `${size}px`;
+        rec.el.style.left = `${item.x - size / 2}px`;
+        rec.el.style.top = `${item.y - size / 2}px`;
+        if (rec.el.title !== (item.title || "")) rec.el.title = item.title || "";
+        if (!rec.bound) {
+            rec.bound = true;
+            // 事件一律就地掐断：不能让它冒到画布/ComfyUI 那边去（否则又变成选中节点）
+            rec.el.addEventListener("pointerdown", (event) => {
+                const data = rec.data;
+                if (event.button === 2) return;          // 右键交给 contextmenu，免得开两次菜单
+                if (!data?.onActivate) return;
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+                data.onActivate(event);
+            }, true);
+            rec.el.addEventListener("contextmenu", (event) => {
+                const data = rec.data;
+                if (!data?.onMenu) return;
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+                data.onMenu(event);
+            }, true);
+        }
+    }
+    for (const [key, rec] of Array.from(handlePool.entries())) {
+        if (seen.has(key)) continue;
+        rec.el.remove();
+        handlePool.delete(key);
+    }
+    const dbg = globalThis.__dnOverlay;
+    if (dbg) dbg.handles = handlePool.size;
+}
+
+/** 登记一个把手提供者：(canvas, toScreen) => [{ key, x, y, size, title, onActivate, onMenu }]。
+ *  x/y 用容器内 CSS 像素（调用 toScreen(画布坐标) 得到）。 */
+export function addHandleProvider(name, fn) {
+    handleProviders.set(name, fn);
+    ensureHooked();
+    return fn;
+}
+
+/** 移除把手提供者。 */
+export function removeHandleProvider(name) {
+    handleProviders.delete(name);
 }
 
 /** 把主画布的前景回调接上覆盖层重绘（幂等）。 */
@@ -141,21 +249,32 @@ function hookCanvas(canvas) {
     }
 }
 
+/** 确保主画布的前景回调已接上（app 还没就绪时轮询等它）。 */
+function ensureHooked() {
+    const canvas = globalThis.app?.canvas;
+    if (canvas) {
+        hookCanvas(canvas);
+        repaint(canvas);
+        return;
+    }
+    let tries = 0;
+    const timer = setInterval(() => {
+        if (globalThis.app?.canvas) {
+            hookCanvas(globalThis.app.canvas);
+            repaint(globalThis.app.canvas);
+            clearInterval(timer);
+        } else if (++tries > 600) {
+            clearInterval(timer);
+        }
+    }, 16);
+}
+
 /** 登记一个「需要画在节点/DOM 控件之上」的绘制函数。
  *  @param name  唯一名字（重复登记会覆盖，便于热刷新）
  *  @param fn    (ctx, canvas) => void，坐标 = 画布坐标（与画布上正常绘制一致） */
 export function addForegroundPainter(name, fn) {
     painters.set(name, fn);
-    const canvas = globalThis.app?.canvas;
-    if (canvas) hookCanvas(canvas);
-    else {
-        // app 还没就绪：轮询等它（本扩展都跑在 setup 里，一般不会走到）
-        let tries = 0;
-        const timer = setInterval(() => {
-            if (globalThis.app?.canvas) { hookCanvas(globalThis.app.canvas); repaint(globalThis.app.canvas); clearInterval(timer); }
-            else if (++tries > 600) clearInterval(timer);
-        }, 16);
-    }
+    ensureHooked();
     return fn;
 }
 
