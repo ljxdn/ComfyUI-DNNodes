@@ -1708,14 +1708,20 @@ async function handleAudioFile(node, file) {
     await loadAndRender(node, savedName);
 }
 
-/** 通过内容感知接口上传图像：同名同内容覆盖，同名不同内容递增编号。 */
+/** 通过内容感知接口上传图像：同名同内容覆盖，同名不同内容递增编号。
+ *  路由：优先本包路径；宿主还没重启（新路由尚未注册）时自动回退到旧包路径，
+ *  这样「换了包但还没重启」的中间状态也能正常粘贴/上传。
+ *  注意：未注册的路径在 ComfyUI 上返回的是 **405**（不是 404），两个都要判。 */
 async function uploadImageToInput(file, filename) {
-    const formData = new FormData();
-    formData.append("image", file, filename);
-    const response = await fetch("/dn/asset_card/upload_image", {
-        method: "POST",
-        body: formData,
-    });
+    const post = async (url) => {
+        const formData = new FormData();
+        formData.append("image", file, filename);
+        return fetch(url, { method: "POST", body: formData });
+    };
+    let response = await post("/dn/asset_card/upload_image");
+    if (response.status === 404 || response.status === 405) {
+        response = await post("/h3/media_loader/upload_image");
+    }
     if (!response.ok) {
         let detail = "HTTP " + response.status;
         try {
