@@ -1,0 +1,12 @@
+# 统一以 LF 存进仓库，避免 Windows 上 core.autocrlf 造成的满屏换行噪声
+* text=auto eol=lf
+
+# 二进制，别做任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
