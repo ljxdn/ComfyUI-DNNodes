@@ -4,8 +4,8 @@
 直接喂给导演台的分段（r2v 分组），并附带一整套顺手的编辑体验
 （单端口多连线、选中高亮上游、提示词富文本编辑器）。
 
-> 节点 id 全部保持原样（`H3MediaLoader` / `DNMediaToDirectorGroup`），
-> **已保存的工作流升级后无需任何改动**。
+![DN 节点效果展示](<assets/DNnodes效果展示.jpg>)
+
 
 ---
 
@@ -32,6 +32,27 @@ git clone https://github.com/ljxdn/ComfyUI-DNNodes.git
 
 想用第二个节点的输出，需要另外安装
 [ComfyUI_MiniMaxH3_Director](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director)（Apache-2.0）。
+
+---
+
+## 示例工作流
+
+[`example_workflows/海螺H3_资产卡&导演台DN.json`](<example_workflows/海螺H3_资产卡&导演台DN.json>)
+—— 「资产卡 → 导演台」的完整链路：**8 张资产卡**整理角色素材 → 两个
+「资产卡 to Director Group」分组 → `Groups Combine` → 导演台出片。
+
+![示例工作流](<example_workflows/海螺H3_资产卡&导演台DN.png>)
+
+**除本包外还需要**（工作流里那个 `所需节点:` 便签也写了同样的清单）：
+
+| 用途 | 仓库 |
+|---|---|
+| 导演台（必需） | [AIMixer/ComfyUI_MiniMaxH3_Director](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director) |
+| 补帧 | [GACLove/ComfyUI-VFI](https://github.com/GACLove/ComfyUI-VFI) |
+| 杂项 / 预览 | [kijai/ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) |
+
+⚠️ **工作流里引用到的图片与音频不在本仓库**（那是示例作者的本地素材，打开时会提示缺失）。
+把它们换成你自己的即可；两个 `Note` 便签里还留了二采降噪、采样步数的调参建议。
 
 ---
 
@@ -74,6 +95,11 @@ ComfyUI-DNNodes/
 ├── nodes.py                       资产卡 to Director Group
 ├── media_group_core.py            分组打包 / 编号 / 最长边缩放
 ├── asset_card.py                  资产卡后端（含上传路由）
+├── assets/
+│   └── DNnodes效果展示.jpg         效果展示图
+├── example_workflows/
+│   ├── 海螺H3_资产卡&导演台DN.json   示例工作流（资产卡 × 导演台）
+│   └── 海螺H3_资产卡&导演台DN.png    预览图
 └── web/js/
     ├── asset_card.js              资产卡自绘 UI
     ├── dn_media_multilink.js      单端口多连线 + 连线右键菜单
@@ -99,11 +125,11 @@ ComfyUI-DNNodes/
 本包以 **MIT** 发布（见 `LICENSE`）。其中：
 
 - **资产卡** 派生自 [ComfyUI-H3-OpenNodes](https://github.com/juntaosun/ComfyUI-H3-OpenNodes)
-  （作者 **sunnyboxs**，MIT）—— 该仓库**已被作者删除**，本包是其唯一维护副本。
+  （作者 **sunnyboxs**，MIT）—— 该仓库**已被作者删除**，本包包含其部分副本。
 - `medias` 多连线机制、`<Picture N>` 编号规则与隐藏槽位设计，同样源自上述项目。
 - 输出格式对接 [ComfyUI_MiniMaxH3_Director](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director)（Apache-2.0，未复制代码）。
 - 富文本编辑器的整体思路参考 [ComfyUI-PainterNodes](https://github.com/princepainter/ComfyUI-PainterNodes)（MIT）
-  与 ComfyUI-MiniMaxH3-Easy（MIT，@nkxx188）。
+  与 [ComfyUI-MiniMaxH3-Easy](https://github.com/nkxx188/ComfyUI-MiniMaxH3-Easy)（MIT，@nkxx188）。
 
 完整的出处、授权与改动范围见 **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**。
 
@@ -116,6 +142,7 @@ ComfyUI-DNNodes/
   - `DN H3 Media to Director Group (R2V)` → 「资产卡 to Director Group」
   - 新增 DOM 覆盖层：选中的高亮连线现在会画在资产卡这类自绘 UI 节点**之上**
   - 资产卡不再残留「控件转输入」的空槽位（原来都叠在节点左上角）
+  - 新增 [`example_workflows/`](example_workflows)：资产卡 × 导演台的整合示例工作流
 - **v1.1.0**（2026-09-16）
   - `medias` 单端口多连线、选中高亮上游、提示词富文本编辑器（芯片 / 缩略图 / `@` 菜单）
   - 导演台「引用上段」守卫
