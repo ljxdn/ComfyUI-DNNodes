@@ -896,6 +896,27 @@ export function refreshPromptMedia(node) {
     }
 }
 
+/** 「资产名没出现在提示词里、后端不会收这张卡」的**来源节点 id 集合**（Number）。
+ *
+ *  给画布层用：连线与中点圆点据此压灰（dn_media_multilink / dn_upstream_highlight），
+ *  与编辑器里的提示条、编号用的是**同一条规则**（见 resolveMedia），不会两边说得不一样。
+ *  与 resolveMedia 同样保守：提示词为空 / 拿不到 → 空集合（不标灰）。 */
+export function getFilteredSourceIds(node) {
+    try {
+        const promptText = promptTextOf(node);
+        const ids = new Set();
+        if (!promptText) return ids;
+        for (const card of flattenCards(node)) {
+            const info = cardInfo(card);
+            if (info.role && !promptText.includes(info.role)) ids.add(Number(info.node.id));
+        }
+        return ids;
+    } catch (error) {
+        warn(error);
+        return new Set();
+    }
+}
+
 /** 把编辑器**外面**那些不该存在的节点扫掉。
  *  历史原因：以前光标定位出错时，字会掉在编辑框外的影子根里，视觉上就是"字跑框外了"。 */
 function sweepStrayNodes(node) {

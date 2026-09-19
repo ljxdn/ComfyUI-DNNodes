@@ -1,6 +1,6 @@
 import { app } from "../../../scripts/app.js";
-import { addForegroundPainter, addHandleProvider, drawVirtualDot, PAINTER_TOP } from "./dn_overlay.js";
-import { refreshPromptMedia } from "./dn_prompt_rich.js";
+import { addForegroundPainter, addHandleProvider, drawVirtualDot, PAINTER_TOP, VIRTUAL_DOT_INACTIVE } from "./dn_overlay.js";
+import { refreshPromptMedia, getFilteredSourceIds } from "./dn_prompt_rich.js";
 
 /*
  * 资产卡 to Director Group —— medias 单端口多连线。
@@ -207,10 +207,14 @@ function drawVirtualLinks(canvas, ctx, options) {
         if (selectedOnly && !isNodeSelected(canvas, target)) continue;
         const targetPoint = getMediaPosition(target);
         if (!targetPoint) continue;
+        // 「资产名不在提示词里」的卡：连线压灰 + 虚线，中点圆点也压灰（序号保留，右键菜单还靠它定位）。
+        // 规则与编辑器里的提示条同源（getFilteredSourceIds ← resolveMedia），不会两边说得不一样。
+        const filteredIds = getFilteredSourceIds(target);
         for (const [index, item] of normalizeLinks(target).entries()) {
             const sourceNode = getNode(graph, item.source_id);
             const sourcePoint = getOutputPosition(sourceNode, Number(item.source_slot));
             if (!sourceNode || !sourcePoint) continue;
+            const off = filteredIds.has(Number(item.source_id));
             const midX = (sourcePoint[0] + targetPoint[0]) / 2;
             const midY = (sourcePoint[1] + targetPoint[1]) / 2;
             if (!dotsOnly) {
@@ -219,11 +223,17 @@ function drawVirtualLinks(canvas, ctx, options) {
                 ctx.moveTo(sourcePoint[0], sourcePoint[1]);
                 ctx.bezierCurveTo(sourcePoint[0] + 80, sourcePoint[1], targetPoint[0] - 80, targetPoint[1], targetPoint[0], targetPoint[1]);
                 ctx.lineWidth = canvas.connections_width || 3;
-                ctx.strokeStyle = globalThis.LGraphCanvas?.link_type_colors?.H3_MEDIA || "#34d399";
+                if (off) {
+                    ctx.setLineDash([7, 6]);
+                    ctx.globalAlpha = 0.8;
+                    ctx.strokeStyle = "#77817d";
+                } else {
+                    ctx.strokeStyle = globalThis.LGraphCanvas?.link_type_colors?.H3_MEDIA || "#34d399";
+                }
                 ctx.stroke();
                 ctx.restore();
             }
-            if (!linesOnly) drawVirtualDot(ctx, midX, midY, index + 1);
+            if (!linesOnly) drawVirtualDot(ctx, midX, midY, index + 1, off ? VIRTUAL_DOT_INACTIVE : undefined);
         }
     }
 }

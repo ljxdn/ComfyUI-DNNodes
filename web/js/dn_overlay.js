@@ -45,21 +45,27 @@ export const VIRTUAL_DOT = {
     font: "bold 12px Arial",
 };
 
-/** 在 (x, y) 画一个带序号的圆点。坐标 = 画布坐标。 */
-export function drawVirtualDot(ctx, x, y, label) {
+/** 「资产名不在提示词里、不计入编号」的圆点配色：整体压灰，一眼和生效的绿点区分开。
+ *  序号**保留**——右键菜单的「序号提前 / 序号退后 / 删除」还靠它在定位。 */
+export const VIRTUAL_DOT_INACTIVE = { fill: "#7f8a86", ring: "#0d1210", text: "#101513" };
+
+/** 在 (x, y) 画一个带序号的圆点。坐标 = 画布坐标。
+ *  `style` 可选，传 { fill, ring, text } 的子集可整体换成灰色态（VIRTUAL_DOT_INACTIVE）。 */
+export function drawVirtualDot(ctx, x, y, label, style) {
     if (!ctx || !Number.isFinite(x) || !Number.isFinite(y)) return;
+    const s = style ? { ...VIRTUAL_DOT, ...style } : VIRTUAL_DOT;
     ctx.save();
     ctx.beginPath();
-    ctx.arc(x, y, VIRTUAL_DOT.radius, 0, Math.PI * 2);
-    ctx.fillStyle = VIRTUAL_DOT.fill;
+    ctx.arc(x, y, s.radius, 0, Math.PI * 2);
+    ctx.fillStyle = s.fill;
     ctx.fill();
-    if (VIRTUAL_DOT.ringWidth > 0) {
-        ctx.lineWidth = VIRTUAL_DOT.ringWidth;
-        ctx.strokeStyle = VIRTUAL_DOT.ring;
+    if (s.ringWidth > 0) {
+        ctx.lineWidth = s.ringWidth;
+        ctx.strokeStyle = s.ring;
         ctx.stroke();
     }
-    ctx.fillStyle = VIRTUAL_DOT.text;
-    ctx.font = VIRTUAL_DOT.font;
+    ctx.fillStyle = s.text;
+    ctx.font = s.font;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(String(label), x, y);

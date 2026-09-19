@@ -1,5 +1,6 @@
 import { app } from "../../../scripts/app.js";
-import { addForegroundPainter, drawVirtualDot, PAINTER_TOP } from "./dn_overlay.js";
+import { addForegroundPainter, drawVirtualDot, PAINTER_TOP, VIRTUAL_DOT_INACTIVE } from "./dn_overlay.js";
+import { getFilteredSourceIds } from "./dn_prompt_rich.js";
 
 /*
  * DN 节点「选中即高亮上游」。
@@ -180,9 +181,23 @@ function mediaPortPos(node) {
     return inputPos(node, index);
 }
 
-/** 画一条高亮连线（在原有连线之上叠一层，不改原 line 对象）。 */
-function strokeLink(ctx, from, to) {
+/** 画一条高亮连线（在原有连线之上叠一层，不改原 line 对象）。
+ *  `off` = 这张卡「资产名不在提示词里、不会被收进分组」→ 高亮也压灰，别再给它镀金。 */
+function strokeLink(ctx, from, to, off) {
     if (!from || !to) return;
+    if (off) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(from[0], from[1]);
+        ctx.bezierCurveTo(from[0] + 80, from[1], to[0] - 80, to[1], to[0], to[1]);
+        ctx.globalAlpha = 0.8;
+        ctx.setLineDash([7, 6]);
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = "#77817d";
+        ctx.stroke();
+        ctx.restore();
+        return;
+    }
     ctx.save();
     ctx.beginPath();
     ctx.moveTo(from[0], from[1]);
@@ -201,6 +216,13 @@ function strokeLink(ctx, from, to) {
     ctx.restore();
 }
 
+/** 按「目标组节点」缓存过滤判定，一轮绘制里同一节点只算一次。 */
+function filteredFor(cache, node) {
+    const key = node?.id ?? "x";
+    if (!cache.has(key)) cache.set(key, getFilteredSourceIds(node));
+    return cache.get(key);
+}
+
 /** 高亮连线层（画在节点下方，与已有连线同层）。只画线 —— 中点的序号圆点
  *  由 drawVirtualDots() 单独一层、且画在**最上层**（高亮之后再画）。 */
 function drawLinkHighlight(ctx) {
@@ -208,10 +230,12 @@ function drawLinkHighlight(ctx) {
     if (!targets.length) return;
     const { links } = collectUpstream(targets);
     if (!links.length) return;
+    const cache = new Map();
     for (const item of links) {
         const from = outputPos(item.fromNode, item.fromSlot);
         const to = item.virtual ? mediaPortPos(item.toNode) : inputPos(item.toNode, mediaInputIndex(item.toNode));
-        strokeLink(ctx, from, to);
+        const off = filteredFor(cache, item.toNode).has(Number(item.fromNode?.id));
+        strokeLink(ctx, from, to, off);
     }
 }
 
@@ -227,6 +251,7 @@ function drawVirtualDots(ctx) {
     const { links } = collectUpstream(targets);
     if (!links.length) return;
     const seen = new Map();
+    const cache = new Map();
     for (const item of links) {
         if (!item.virtual) continue;
         const key = item.toNode?.id;
@@ -235,7 +260,8 @@ function drawVirtualDots(ctx) {
         const from = outputPos(item.fromNode, item.fromSlot);
         const to = mediaPortPos(item.toNode);
         if (!from || !to) continue;
-        drawVirtualDot(ctx, (from[0] + to[0]) / 2, (from[1] + to[1]) / 2, order);
+        const off = filteredFor(cache, item.toNode).has(Number(item.fromNode?.id));
+        drawVirtualDot(ctx, (from[0] + to[0]) / 2, (from[1] + to[1]) / 2, order, off ? VIRTUAL_DOT_INACTIVE : undefined);
     }
 }
 
