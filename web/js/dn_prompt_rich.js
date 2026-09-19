@@ -25,6 +25,7 @@ const NODE_CLASS = "DNMediaToDirectorGroup";
 const WIDGET_NAME = "prompt";
 const UI_WIDGET = "dn_prompt_ui";
 const ROOT_CLASS = "dnp-root";
+const FILTER_WARN_CLASS = "dnp-filter-warn";
 const EDITOR_CLASS = "dnp-editor";
 const CHIP_CLASS = "dnp-chip";
 const SHOT_CLASS = "dnp-shot";
@@ -290,14 +291,43 @@ function viewUrl(filename) {
     return filename ? `/view?filename=${encodeURIComponent(filename)}&type=input` : "";
 }
 
-/** 解析出 { pictures, videos, audios, assets }，编号 1 起、与提示词里的标签一致。 */
+/** 节点上提示词的纯文本（与后端 build_r2v_group 同口径：strip 过的字符串）。
+ *  拿不到（widget 缺失 / 被转成了输入连线）→ 返回 null，此时前端不做过滤。 */
+function promptTextOf(node) {
+    const value = widgetValue(node, WIDGET_NAME);
+    if (value === undefined || value === null) return null;
+    return String(value).trim();
+}
+
+/** 解析出 { pictures, videos, audios, assets, filteredOut }，编号 1 起、与提示词里的标签一致。
+ *
+ *  这里**复刻后端 media_group_core.filter_unused_role_medias 的同一条规则**：
+ *  资产名（role_name）非空、且没出现在提示词文本里的卡，后端在编号**之前**就会丢掉。
+ *  前端以前不过滤 → 提示词里的 <Picture N> 与实际喂进模型的编号会错位
+ *  （例：连 A、B、C，提示词只提到 A 和 C → 后端保留 [A,C]，C 是 <Picture 2>，编辑器却画成 3）。
+ *  现在对齐后，编辑器显示的编号永远等于实际编号；被丢的卡不静默——放进 filteredOut，
+ *  由编辑框上方的琥珀色提示条显形（updateFilterWarn）。
+ *
+ *  两个有意的偏差（改后端规则时要回头看这里）：
+ *  ① 提示词为空时不过滤 —— 后端此时本来也跑不起来（"至少需要一段提示词…"），别让编辑器闪着吓人；
+ *  ② 提示词拿不到（转成了输入连线）时不过滤 —— 无法判断就别装能判断。 */
 function resolveMedia(node) {
-    const cards = flattenCards(node);
+    const promptText = promptTextOf(node);
+    const entries = flattenCards(node).map((card) => ({ card, info: cardInfo(card) }));
+    const kept = [];
+    const filteredOut = [];
+    for (const entry of entries) {
+        const { info } = entry;
+        if (promptText && info.role && !promptText.includes(info.role)) {
+            filteredOut.push({ role: info.role, image: info.image, audio: info.audio, sourceNode: info.node });
+            continue;
+        }
+        kept.push(entry);
+    }
     const pictures = [];
     const audios = [];
     const assets = [];
-    for (const card of cards) {
-        const info = cardInfo(card);
+    for (const { info } of kept) {
         if (info.image) {
             pictures.push({
                 ordinal: pictures.length + 1,
@@ -315,9 +345,17 @@ function resolveMedia(node) {
                 sourceNode: info.node,
             });
         }
+    }
+    // 资产名清单取**全部**卡（含被过滤的）：@ 菜单里点一下名字写进提示词，这张卡就回来了。
+    for (const { info } of entries) {
         if (info.role && !assets.includes(info.role)) assets.push(info.role);
     }
-    return { pictures, videos: [], audios, assets, colors: buildAssetColors(assets) };
+    return {
+        pictures, videos: [], audios, assets,
+        colors: buildAssetColors(assets),
+        filteredOut,
+        promptKnown: Boolean(promptText),
+    };
 }
 
 /* ================================================================
@@ -820,8 +858,42 @@ function renderFromWidget(node) {
     const keep = editor.scrollTop || 0;
     sweepStrayNodes(node);
     node.__dnpMedia = resolveMedia(node);
+    updateFilterWarn(node);
     renderInto(editor, String(widget.value ?? ""), node.__dnpMedia);
     editor.scrollTop = keep;
+}
+
+/** 把「被后端规则丢掉的卡」亮出来：编辑框上方一条琥珀色提示，不静默。
+ *  没有被丢的卡 → 提示条收起，和以前长得一模一样。 */
+function updateFilterWarn(node) {
+    const el = node?.__dnpFilterWarn;
+    const media = node?.__dnpMedia;
+    if (!el || !media) return;
+    const list = Array.isArray(media.filteredOut) ? media.filteredOut : [];
+    if (!list.length) {
+        el.classList.remove("dnp-show");
+        el.textContent = "";
+        return;
+    }
+    const names = [...new Set(list.map((item) => item.role))].join("、");
+    el.textContent = `${list.length} 张卡不计入编号 —— 提示词里没提到资产名：${names}。`
+        + "把资产名写进提示词就会回来，或者断开这条连线。";
+    el.classList.add("dnp-show");
+}
+
+/** 供其它扩展在「连线 / 资产卡变了」时让编辑器重算编号（dn_media_multilink 在写回连线时调用）。
+ *  没建过编辑器（比如还没打开过节点）就只重算数据，别去碰 DOM。 */
+export function refreshPromptMedia(node) {
+    try {
+        if (!node) return;
+        if (node.__dnpEditor) renderFromWidget(node);
+        else {
+            node.__dnpMedia = resolveMedia(node);
+            updateFilterWarn(node);
+        }
+    } catch (error) {
+        warn(error);
+    }
 }
 
 /** 把编辑器**外面**那些不该存在的节点扫掉。
@@ -832,7 +904,7 @@ function sweepStrayNodes(node) {
     if (!root || !editor) return;
     let dirty = false;
     for (const child of Array.from(root.childNodes)) {
-        if (child === editor || child.nodeType === 1 && (child.tagName === "STYLE" || child.classList?.contains("dnp-bar") || child.classList?.contains(RAW_CLASS))) continue;
+        if (child === editor || child.nodeType === 1 && (child.tagName === "STYLE" || child.classList?.contains("dnp-bar") || child.classList?.contains(RAW_CLASS) || child.classList?.contains(FILTER_WARN_CLASS))) continue;
         if (child.nodeType === 3 && !(child.textContent || "").trim()) continue;
         child.remove();
         dirty = true;
@@ -871,6 +943,11 @@ function ensureEditor(node) {
     hint.textContent = "@ 引用素材 · 【 开对话，空格结束 · [Shot 2] 镜头 · <Picture 1> 图片";
     bar.append(toggle, hint);
 
+    // 「不计入编号」提示条（琥珀色，默认收起）：有卡被后端规则丢掉时才亮，见 resolveMedia。
+    const filterWarn = document.createElement("div");
+    filterWarn.className = FILTER_WARN_CLASS;
+    filterWarn.setAttribute("role", "status");
+
     const editor = document.createElement("div");
     editor.className = EDITOR_CLASS;
     editor.contentEditable = "true";
@@ -893,8 +970,9 @@ function ensureEditor(node) {
     }));
 
     // 有 shadow root 就装影子里（样式隔离 + 躲开扫 DOM 的扩展），退化时直接装宿主
-    (root === wrap ? wrap : root).append(bar, editor, rawBox);
+    (root === wrap ? wrap : root).append(bar, filterWarn, editor, rawBox);
     node.__dnpEditor = editor;
+    node.__dnpFilterWarn = filterWarn;
     node.__dnpRawBox = rawBox;
     node.__dnpWrap = wrap;
     node.__dnpShadow = root === wrap ? null : root;
@@ -997,6 +1075,7 @@ function ensureEditor(node) {
     applyRawMode(node, Boolean(node.properties?.[RAW_PROP]));
     renderFromWidget(node);
     node.__dnpMedia = resolveMedia(node);
+    updateFilterWarn(node);
     fitHeight(node);
     [220, 900, 1800].forEach((delay) => setTimeout(() => {
         if (!node.__dnpEditor) return;
@@ -1711,6 +1790,11 @@ const CSS_TEXT = `
   border:1px solid var(--border-color,#4b5563); background:rgba(255,255,255,.06); color:var(--input-text,#e5e7eb); }
 .dnp-toggle:hover { background:rgba(255,255,255,.14); }
 .dnp-hint { font-size:10px; opacity:.55; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+/* 「不计入编号」提示条：默认不显示，updateFilterWarn() 按需点亮（规则见 resolveMedia） */
+.dnp-filter-warn { display:none; flex:0 0 auto; padding:5px 9px; border-radius:6px;
+  font-size:11px; line-height:1.6; border:1px solid rgba(245,185,66,.5);
+  background:rgba(245,185,66,.14); color:#f5b942; }
+.dnp-filter-warn.dnp-show { display:block; }
 .dnp-editor, .dnp-raw { position:relative; width:100%; box-sizing:border-box; padding:6px 8px;
   border:1px solid var(--border-color,#4b5563); border-radius:6px;
   /* 底色与字号都对齐 ComfyUI 原生文本框（--comfy-input-bg 默认 #222，--comfy-textarea-font-size 本机 15px） */
@@ -1893,6 +1977,7 @@ function installNode(nodeType, nodeData) {
             installStyles();
             ensureEditor(this);
             this.__dnpMedia = resolveMedia(this);
+            updateFilterWarn(this);
             if (!this.__dnpRaw) renderFromWidget(this);
             else applyRawMode(this, true);
             this.__dnpHistory = [];

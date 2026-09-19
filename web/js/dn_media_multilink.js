@@ -1,5 +1,6 @@
 import { app } from "../../../scripts/app.js";
 import { addForegroundPainter, addHandleProvider, drawVirtualDot, PAINTER_TOP } from "./dn_overlay.js";
+import { refreshPromptMedia } from "./dn_prompt_rich.js";
 
 /*
  * 资产卡 to Director Group —— medias 单端口多连线。
@@ -316,6 +317,7 @@ function removeVirtualLink(targetNode, index) {
     if (index < 0 || index >= links.length) return false;
     links.splice(index, 1);
     normalizeLinks(targetNode);
+    refreshPromptMedia(targetNode);      // 连线变了 → 编辑器的 <Picture N> 编号 / 提示条跟着重算
     targetNode.setDirtyCanvas?.(true, true);
     (targetNode.graph || app.graph)?.setDirtyCanvas?.(true, true);
     (targetNode.graph || app.graph)?.change?.();
@@ -327,6 +329,7 @@ function writeLinks(node, list) {
     node.properties = node.properties || {};
     node.properties[LINKS_PROPERTY] = Array.isArray(list) ? list.slice(0, MAX_MEDIA) : [];
     normalizeLinks(node);
+    refreshPromptMedia(node);            // 连线变了 → 编辑器的 <Picture N> 编号 / 提示条跟着重算
     node.setDirtyCanvas?.(true, true);
     (node.graph || app.graph)?.setDirtyCanvas?.(true, true);
     (node.graph || app.graph)?.change?.();
