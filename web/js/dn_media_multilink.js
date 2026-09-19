@@ -1,6 +1,6 @@
 import { app } from "../../../scripts/app.js";
 import { addForegroundPainter, addHandleProvider, drawVirtualDot, PAINTER_TOP, VIRTUAL_DOT_INACTIVE } from "./dn_overlay.js";
-import { refreshPromptMedia, getFilteredSourceIds } from "./dn_prompt_rich.js";
+import { refreshPromptMedia, getLinkBadges } from "./dn_prompt_rich.js";
 
 /*
  * 资产卡 to Director Group —— medias 单端口多连线。
@@ -207,14 +207,16 @@ function drawVirtualLinks(canvas, ctx, options) {
         if (selectedOnly && !isNodeSelected(canvas, target)) continue;
         const targetPoint = getMediaPosition(target);
         if (!targetPoint) continue;
-        // 「资产名不在提示词里」的卡：连线压灰 + 虚线，中点圆点也压灰（序号保留，右键菜单还靠它定位）。
-        // 规则与编辑器里的提示条同源（getFilteredSourceIds ← resolveMedia），不会两边说得不一样。
-        const filteredIds = getFilteredSourceIds(target);
+        // 「资产名不在提示词里」的卡：连线压灰 + 虚线，中点圆点压灰且**不画数字**。
+        // 圆点数字 = 后端实际会给的编号（过滤后重排），不再用连线序号 —— 两者否则会错位
+        // （例：虚线在第 2 位时，后端只编 1、2，连线序号却写着 1、2、3）。
+        const badges = getLinkBadges(target);
         for (const [index, item] of normalizeLinks(target).entries()) {
             const sourceNode = getNode(graph, item.source_id);
             const sourcePoint = getOutputPosition(sourceNode, Number(item.source_slot));
             if (!sourceNode || !sourcePoint) continue;
-            const off = filteredIds.has(Number(item.source_id));
+            const badge = badges.get(Number(item.source_id));
+            const off = Boolean(badge?.off);
             const midX = (sourcePoint[0] + targetPoint[0]) / 2;
             const midY = (sourcePoint[1] + targetPoint[1]) / 2;
             if (!dotsOnly) {
@@ -233,7 +235,10 @@ function drawVirtualLinks(canvas, ctx, options) {
                 ctx.stroke();
                 ctx.restore();
             }
-            if (!linesOnly) drawVirtualDot(ctx, midX, midY, index + 1, off ? VIRTUAL_DOT_INACTIVE : undefined);
+            if (!linesOnly) {
+                const label = badge ? badge.label : String(index + 1);
+                drawVirtualDot(ctx, midX, midY, label, off ? VIRTUAL_DOT_INACTIVE : undefined);
+            }
         }
     }
 }

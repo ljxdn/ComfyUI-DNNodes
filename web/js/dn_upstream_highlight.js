@@ -1,6 +1,6 @@
 import { app } from "../../../scripts/app.js";
 import { addForegroundPainter, drawVirtualDot, PAINTER_TOP, VIRTUAL_DOT_INACTIVE } from "./dn_overlay.js";
-import { getFilteredSourceIds } from "./dn_prompt_rich.js";
+import { getLinkBadges } from "./dn_prompt_rich.js";
 
 /*
  * DN 节点「选中即高亮上游」。
@@ -216,10 +216,10 @@ function strokeLink(ctx, from, to, off) {
     ctx.restore();
 }
 
-/** 按「目标组节点」缓存过滤判定，一轮绘制里同一节点只算一次。 */
-function filteredFor(cache, node) {
+/** 按「目标组节点」缓存编号/过滤判定，一轮绘制里同一节点只算一次。 */
+function badgesFor(cache, node) {
     const key = node?.id ?? "x";
-    if (!cache.has(key)) cache.set(key, getFilteredSourceIds(node));
+    if (!cache.has(key)) cache.set(key, getLinkBadges(node));
     return cache.get(key);
 }
 
@@ -234,7 +234,7 @@ function drawLinkHighlight(ctx) {
     for (const item of links) {
         const from = outputPos(item.fromNode, item.fromSlot);
         const to = item.virtual ? mediaPortPos(item.toNode) : inputPos(item.toNode, mediaInputIndex(item.toNode));
-        const off = filteredFor(cache, item.toNode).has(Number(item.fromNode?.id));
+        const off = Boolean(badgesFor(cache, item.toNode).get(Number(item.fromNode?.id))?.off);
         strokeLink(ctx, from, to, off);
     }
 }
@@ -260,8 +260,11 @@ function drawVirtualDots(ctx) {
         const from = outputPos(item.fromNode, item.fromSlot);
         const to = mediaPortPos(item.toNode);
         if (!from || !to) continue;
-        const off = filteredFor(cache, item.toNode).has(Number(item.fromNode?.id));
-        drawVirtualDot(ctx, (from[0] + to[0]) / 2, (from[1] + to[1]) / 2, order, off ? VIRTUAL_DOT_INACTIVE : undefined);
+        const badge = badgesFor(cache, item.toNode).get(Number(item.fromNode?.id));
+        const off = Boolean(badge?.off);
+        // 数字 = 后端实际会给的编号（被丢的卡不吃号、不画数字），不再用连线序号
+        const label = badge ? badge.label : String(order);
+        drawVirtualDot(ctx, (from[0] + to[0]) / 2, (from[1] + to[1]) / 2, label, off ? VIRTUAL_DOT_INACTIVE : undefined);
     }
 }
 
@@ -283,12 +286,19 @@ function titleHeight() {
     return Number.isFinite(v) && v > 0 ? v : 30;
 }
 
-/** 高亮节点描边层（画在节点之上，所以边框不会被节点本身盖住）。 */
+/** 高亮节点描边层（画在节点之上，所以边框不会被节点本身盖住）。
+ *  「资产名不在提示词里」的卡：圈也压灰（无外发光），不再镀金 —— 金光 = 后端真的会用它。 */
 function drawNodeRings(ctx) {
     const targets = selectedTargets();
     if (!targets.length) return;
-    const { nodes } = collectUpstream(targets);
+    const { nodes, links } = collectUpstream(targets);
     if (!nodes.size) return;
+    const offIds = new Set();
+    const cache = new Map();
+    for (const item of links) {
+        const id = Number(item.fromNode?.id);
+        if (badgesFor(cache, item.toNode).get(id)?.off) offIds.add(id);
+    }
     const scale = app?.canvas?.ds?.scale || 1;
     const lineWidth = 2.5 / scale;
     const th = titleHeight();
@@ -303,6 +313,7 @@ function drawNodeRings(ctx) {
         const y = pos[1] - th - RING_PAD;
         const w = size[0] + RING_PAD * 2;
         const h = bodyH + th + RING_PAD * 2;
+        const off = offIds.has(Number(node.id));
         ctx.beginPath();
         const r = 8 / scale;
         ctx.moveTo(x + r, y);
@@ -316,12 +327,12 @@ function drawNodeRings(ctx) {
         ctx.quadraticCurveTo(x, y, x + r, y);
         ctx.closePath();
         ctx.lineWidth = lineWidth + 2 / scale;
-        ctx.strokeStyle = COLOR_SOFT;
-        ctx.shadowColor = COLOR;
-        ctx.shadowBlur = 14;
+        ctx.strokeStyle = off ? "rgba(119,129,125,0.25)" : COLOR_SOFT;
+        ctx.shadowColor = off ? "#77817d" : COLOR;
+        ctx.shadowBlur = off ? 0 : 14;
         ctx.stroke();
         ctx.lineWidth = lineWidth;
-        ctx.strokeStyle = COLOR;
+        ctx.strokeStyle = off ? "#77817d" : COLOR;
         ctx.stroke();
     }
     ctx.restore();

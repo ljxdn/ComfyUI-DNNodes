@@ -917,6 +917,41 @@ export function getFilteredSourceIds(node) {
     }
 }
 
+/** 每条来源卡在**后端口径**下的显示信息：Map<来源节点 id, { off, label }>。
+ *
+ *  off   = 资产名没出现在提示词里，后端不会收这张卡
+ *  label = 后端实际会给的编号：带图 → <Picture N>；只带音 → <Audio J>；都没有 → ""
+ *  编号按**过滤之后**的顺序数 —— 被丢的卡不吃号，后面的卡往前补，
+ *  连线圆点显示的数字从此与后端一致（不再出现"虚线 2、实线 1 3、后端却是 1 2"的错位）。
+ *  被丢的卡 label 为空串 → 圆点不画数字（灰点本来就在说"这张不算"）。
+ *  与 resolveMedia / getFilteredSourceIds 同一条规则、同样保守（提示词拿不到 → 全部不标灰）。 */
+export function getLinkBadges(node) {
+    try {
+        const map = new Map();
+        if (!node) return map;
+        const promptText = promptTextOf(node);
+        const entries = flattenCards(node).map((card) => ({ card, info: cardInfo(card) }));
+        let pic = 0;
+        let aud = 0;
+        for (const { card, info } of entries) {
+            const id = Number(info.node.id);
+            if (map.has(id)) continue;          // 同一张卡接了两条线：以第一条为准
+            const off = Boolean(promptText && info.role && !promptText.includes(info.role));
+            let label = "";
+            if (!off) {
+                if (info.image) pic += 1;
+                if (info.audio) aud += 1;
+                label = info.image ? String(pic) : (info.audio ? String(aud) : "");
+            }
+            map.set(id, { off, label });
+        }
+        return map;
+    } catch (error) {
+        warn(error);
+        return new Map();
+    }
+}
+
 /** 把编辑器**外面**那些不该存在的节点扫掉。
  *  历史原因：以前光标定位出错时，字会掉在编辑框外的影子根里，视觉上就是"字跑框外了"。 */
 function sweepStrayNodes(node) {
