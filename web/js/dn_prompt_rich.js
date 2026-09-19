@@ -938,17 +938,218 @@ export function getLinkBadges(node) {
             if (map.has(id)) continue;          // 同一张卡接了两条线：以第一条为准
             const off = Boolean(promptText && info.role && !promptText.includes(info.role));
             let label = "";
+            let myPic = 0;
+            let myAud = 0;
             if (!off) {
-                if (info.image) pic += 1;
-                if (info.audio) aud += 1;
+                // ⚠️ pic/aud 用的是**外层**计数器 —— 循环里再声明 let 会把计数器遮蔽成"每张卡都从 1 数"
+                //    且没图/没音的卡必须存 0，不能把计数器当前值带出去（会污染"编号→卡"反查表）
+                if (info.image) { pic += 1; myPic = pic; }
+                if (info.audio) { aud += 1; myAud = aud; }
                 label = info.image ? String(pic) : (info.audio ? String(aud) : "");
             }
-            map.set(id, { off, label });
+            map.set(id, { off, label, pic: myPic, aud: myAud });
         }
         return map;
     } catch (error) {
         warn(error);
         return new Map();
+    }
+}
+
+/** 按新旧两份编号，算出提示词里 <Picture N> / <Audio J> 的重映射表。
+ *  语义是"引用还是那个角色的素材"：旧编号 → 它属于哪张卡 → 这张卡的新编号。
+ *  被换出去的那张卡，它的 token 归到**顶上来的新卡**（占的是同一条连线位置）；
+ *  新卡没有对应素材（比如旧卡带音新卡没音）就不映射，让它变成缺失态、由警告提示。 */
+function buildRemaps(node, index, toId, toSlot, oldRole, newRole) {
+    const remaps = [];
+    const links = node?.properties?.dn_media_to_group_links;
+    if (!Array.isArray(links) || index < 0 || index >= links.length) return remaps;
+    const outId = Number(links[index].source_id);
+    const oldBadges = getLinkBadges(node);
+    const saved = JSON.parse(JSON.stringify(links));
+    const widget = getWidget(node, WIDGET_NAME);
+    const savedText = String(widget?.value ?? "");
+    links[index] = { ...links[index], source_id: Number(toId), source_slot: Number(toSlot) || 0 };
+    // 重映射必须对着**最终状态**算：rewrite 模式下名字会写进提示词，新卡不会被过滤 ——
+    // 拿"名字还没改"的中间态算编号，会把不该动的 token 也映射一遍
+    if (widget && oldRole && newRole && oldRole !== newRole && savedText.includes(oldRole)) {
+        const renamed = savedText.split(oldRole).join(newRole);
+        widget.value = renamed;
+        if (widget._state) widget._state.value = renamed;
+    }
+    const newBadges = getLinkBadges(node);
+    node.properties.dn_media_to_group_links = saved;      // 只算不落：真正的换由 applyCardSwap 做
+    if (widget) {
+        widget.value = savedText;
+        if (widget._state) widget._state.value = savedText;
+    }
+    const collect = (key, type) => {
+        const oldRev = new Map();                          // 旧编号 -> 卡 id
+        for (const [id, badge] of oldBadges) {
+            if (!badge.off && badge[key] > 0) oldRev.set(badge[key], id);
+        }
+        for (const [ordinal, id] of oldRev) {
+            const targetId = id === outId ? Number(toId) : id;
+            const nb = newBadges.get(targetId);
+            const nv = nb && !nb.off ? nb[key] : 0;
+            if (nv > 0 && nv !== ordinal) remaps.push({ type, from: ordinal, to: nv });
+        }
+    };
+    collect("pic", "Picture");
+    collect("aud", "Audio");
+    return { remaps, newBadges };
+}
+
+/** 把提示词里的旧编号 token 同步替换成新编号（占位符法，链式映射 1→2、2→3 也不会串）。 */
+function applyRemapTokens(text, remaps) {
+    if (!Array.isArray(remaps) || !remaps.length) return text;
+    let out = text;
+    const placeholders = remaps.map((r, i) => `\u0001DN${i}\u0001`);
+    remaps.forEach((r, i) => {
+        out = out.replace(new RegExp(`<${r.type}\\s+${r.from}>`, "g"), placeholders[i]);
+    });
+    remaps.forEach((r, i) => {
+        out = out.split(placeholders[i]).join(`<${r.type} ${r.to}>`);
+    });
+    return out;
+}
+
+/** 提示词里是否真的有旧资产名可替换（给 link-only 模式的提醒用）。 */
+function nameCountWouldBe(text, oldRole, newRole) {
+    return Boolean(oldRole && newRole && oldRole !== newRole && text.split(oldRole).length > 1);
+}
+
+/** 预演一次换卡：不落盘，返回这份替换会动提示词的哪些地方（给确认框用）。 */
+export function planCardSwap(node, index, toId, toSlot) {
+    try {
+        const links = node?.properties?.dn_media_to_group_links;
+        if (!Array.isArray(links) || index < 0 || index >= links.length) return null;
+        const graph = node.graph || app.graph;
+        const oldCard = graph?.getNodeById?.(Number(links[index].source_id));
+        const newCard = graph?.getNodeById?.(Number(toId));
+        if (!oldCard || !newCard) return null;
+        const oldInfo = cardInfo({ node: oldCard });
+        const newInfo = cardInfo({ node: newCard });
+        const beforeText = String(widgetValue(node, WIDGET_NAME) ?? "");
+        const oldBadges = getLinkBadges(node);
+        const { remaps, newBadges } = buildRemaps(node, index, toId, toSlot, oldInfo.role, newInfo.role);
+        const nameCount = oldInfo.role && newInfo.role && oldInfo.role !== newInfo.role
+            ? beforeText.split(oldInfo.role).length - 1
+            : 0;
+        const contexts = [];
+        if (nameCount) {
+            let pos = 0;
+            for (let n = 0; n < nameCount && contexts.length < 6; n += 1) {
+                const at = beforeText.indexOf(oldInfo.role, pos);
+                if (at < 0) break;
+                contexts.push(beforeText.slice(Math.max(0, at - 16), at + oldInfo.role.length + 20).replace(/\s+/g, " "));
+                pos = at + oldInfo.role.length;
+            }
+        }
+        const warnings = [];
+        if (!newInfo.role) warnings.push("新卡没填资产名 —— 替换后它不会计入编号（提示条会亮）");
+        if (oldInfo.role && newInfo.role && oldInfo.role !== newInfo.role
+            && (newInfo.role.includes(oldInfo.role) || oldInfo.role.includes(newInfo.role))) {
+            warnings.push("新旧资产名互为子串，按原文全部替换可能误伤别的词 —— 请看清下面列出的每处上下文");
+        }
+        const nb = newBadges.get(Number(toId)) || null;
+        // ⚠️ 这里不能用 links[index].source_id —— buildRemaps 还原时换了数组，旧引用已脱钩（读到的是换后的）
+        const ob = oldBadges.get(Number(oldCard.id));
+        if (ob?.pic > 0 && !(nb && !nb.off && nb.pic > 0)) warnings.push(`新卡没有图片，旧卡的 <Picture ${ob.pic}> 将失去对应物`);
+        if (ob?.aud > 0 && !(nb && !nb.off && nb.aud > 0)) warnings.push(`新卡没有音频，旧卡的 <Audio ${ob.aud}> 将失去对应物`);
+        return {
+            oldRole: oldInfo.role,
+            newRole: newInfo.role,
+            sameRole: oldInfo.role === newInfo.role,
+            nameCount,
+            contexts,
+            remaps,
+            warnings,
+        };
+    } catch (error) {
+        warn(error);
+        return null;
+    }
+}
+
+/** 执行换卡。mode = "rewrite"（换连线＋改提示词）或 "link-only"（只换连线）。
+ *  返回 { oldRole, newRole, nameCount, remaps, warnings, undo }；undo() 一次性还原连线与提示词。 */
+export function applyCardSwap(node, index, toId, toSlot, mode) {
+    try {
+        const links = node?.properties?.dn_media_to_group_links;
+        if (!Array.isArray(links) || index < 0 || index >= links.length) return null;
+        const graph = node.graph || app.graph;
+        const oldCard = graph?.getNodeById?.(Number(links[index].source_id));
+        const newCard = graph?.getNodeById?.(Number(toId));
+        if (!oldCard || !newCard) return null;
+        const oldInfo = cardInfo({ node: oldCard });
+        const newInfo = cardInfo({ node: newCard });
+        const beforeText = String(widgetValue(node, WIDGET_NAME) ?? "");
+        const saved = JSON.parse(JSON.stringify(links));
+        const remaps = buildRemaps(node, index, toId, toSlot, oldInfo.role, newInfo.role).remaps;   // 内部会临时换、算完还原
+
+        // buildRemaps 还原时给 properties 换了新数组 —— 这里必须重新拿活的引用再换
+        const live = node.properties.dn_media_to_group_links;
+        live[index] = { ...live[index], source_id: Number(toId), source_slot: Number(toSlot) || 0 };
+        live.forEach((link, i) => { link.order = i + 1; });      // 与 normalizeLinks 的 order 口径一致
+        node.properties.dn_media_to_group_links = live;
+        const newBadges = getLinkBadges(node);
+
+        const warnings = [];
+        const nb = newBadges.get(Number(toId));
+        if (!newInfo.role) warnings.push("新卡没填资产名，替换后不会计入编号（提示条会亮）");
+        if (oldInfo.image && !(nb && !nb.off && nb.pic > 0)) warnings.push(`新卡没有图片，<Picture …> 将失去对应物`);
+        if (oldInfo.audio && !(nb && !nb.off && nb.aud > 0)) warnings.push(`新卡没有音频，<Audio …> 将失去对应音频`);
+        if (mode !== "rewrite" && (nameCountWouldBe(beforeText, oldInfo.role, newInfo.role) || remaps.length)) {
+            warnings.push("提示词没有同步修改 —— 记得自己改资产名/编号");
+        }
+
+        let nameCount = 0;
+        if (mode === "rewrite") {
+            let text = beforeText;
+            if (oldInfo.role && newInfo.role && oldInfo.role !== newInfo.role) {
+                nameCount = text.split(oldInfo.role).length - 1;
+                if (nameCount) text = text.split(oldInfo.role).join(newInfo.role);
+            }
+            text = applyRemapTokens(text, remaps);
+            const widget = getWidget(node, WIDGET_NAME);
+            if (widget) {
+                widget.value = text;
+                if (widget._state) widget._state.value = text;
+            }
+            renderFromWidget(node);
+        }
+        refreshPromptMedia(node);
+        node.setDirtyCanvas?.(true, true);
+        try { app.graph?.change?.(); } catch (error) { /* 忽略 */ }
+
+        const undo = () => {
+            try {
+                node.properties.dn_media_to_group_links = JSON.parse(JSON.stringify(saved));
+                const w = getWidget(node, WIDGET_NAME);
+                if (w) {
+                    w.value = beforeText;
+                    if (w._state) w._state.value = beforeText;
+                }
+                renderFromWidget(node);
+                refreshPromptMedia(node);
+                node.setDirtyCanvas?.(true, true);
+                try { app.graph?.change?.(); } catch (error) { /* 忽略 */ }
+            } catch (error) {
+                warn(error);
+            }
+        };
+        return {
+            oldRole: oldInfo.role,
+            newRole: newInfo.role,
+            nameCount,
+            remaps,
+            warnings,
+            undo,
+        };
+    } catch (error) {
+        warn(error);
+        return null;
     }
 }
 

@@ -1,6 +1,6 @@
 import { app } from "../../../scripts/app.js";
 import { addForegroundPainter, addHandleProvider, drawVirtualDot, PAINTER_TOP, VIRTUAL_DOT_INACTIVE } from "./dn_overlay.js";
-import { refreshPromptMedia, getLinkBadges } from "./dn_prompt_rich.js";
+import { refreshPromptMedia, getLinkBadges, planCardSwap, applyCardSwap } from "./dn_prompt_rich.js";
 
 /*
  * 资产卡 to Director Group —— medias 单端口多连线。
@@ -400,6 +400,8 @@ function openLinkMenu(canvas, hit, event) {
             items.push(null);
         }
         items.push({ content: "删除这条连线", callback: run(() => removeVirtualLink(hit.targetNode, hit.index)) });
+        items.push(null);
+        items.push({ content: "替换这张卡…", callback: run(() => openCardPicker(anchor, hit)) });
         menuInstance = new globalThis.LiteGraph.ContextMenu(items, { event: menuEvent });
     }
 }
@@ -630,3 +632,290 @@ function registerWhenAppReady() {
 }
 
 registerWhenAppReady();
+
+/* ================================================================
+ * 8. 替换这张卡：圆点菜单 → 搜全工作流的资产卡 → 换连线（＋改提示词）
+ * ================================================================ */
+
+const PICKER_STYLE_ID = "dn-card-picker-style";
+const PICKER_WIDTH = 320;
+const PICKER_ROW = 46;          // 单行高度（缩略图 38 + 上下留白）
+const PICKER_VISIBLE_ROWS = 5;  // 不用滑杆能直接看到的行数
+
+function ensurePickerStyles() {
+    if (document.getElementById(PICKER_STYLE_ID)) return;
+    const el = document.createElement("style");
+    el.id = PICKER_STYLE_ID;
+    el.textContent = `
+.dn-card-picker { position: fixed; z-index: 100100; width: ${PICKER_WIDTH}px; padding: 6px; border-radius: 8px;
+  background: #1b1f2a; border: 1px solid rgba(148,163,184,.35); box-shadow: 0 8px 24px rgba(0,0,0,.45);
+  font: 12px/1.5 sans-serif; color: #e5e7eb; }
+.dn-card-search { width: 100%; box-sizing: border-box; padding: 5px 8px; margin-bottom: 6px; border-radius: 6px;
+  border: 1px solid rgba(148,163,184,.4); background: #12151d; color: #e5e7eb; outline: none; font-size: 12px; }
+.dn-card-search:focus { border-color: #7dd3fc; }
+.dn-card-list { max-height: ${PICKER_VISIBLE_ROWS * PICKER_ROW}px; overflow-y: auto; }
+.dn-card-row { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 6px; cursor: pointer; }
+.dn-card-row:hover { background: rgba(245,185,66,.18); }
+.dn-card-thumb { width: 38px; height: 38px; border-radius: 5px; object-fit: cover; background: #0c0f16; flex: 0 0 auto; display: block; }
+.dn-card-thumb.is-audio { display: flex; align-items: center; justify-content: center; color: #93c5fd; font-size: 15px; }
+.dn-card-main { min-width: 0; flex: 1; }
+.dn-card-name { font-size: 12px; color: #e5e7eb; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dn-card-sub { font-size: 10px; opacity: .6; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dn-card-empty { padding: 16px 8px; text-align: center; opacity: .55; font-size: 12px; }
+.dn-card-preview { position: fixed; z-index: 100101; width: 220px; padding: 5px; border-radius: 8px;
+  background: rgba(12,16,24,.96); border: 1px solid rgba(245,185,66,.5); pointer-events: none; display: none; }
+.dn-card-preview img { width: 100%; display: block; border-radius: 5px; }
+.dn-card-preview .dn-card-preview-name { font-size: 11px; color: #e5e7eb; padding-top: 4px; text-align: center; }
+.dn-swap-dialog { position: fixed; z-index: 100102; width: 400px; max-width: 94vw; max-height: 70vh; overflow: auto;
+  padding: 10px 12px; border-radius: 10px; background: #1b1f2a; border: 1px solid rgba(245,185,66,.5);
+  box-shadow: 0 12px 30px rgba(0,0,0,.55); font: 12px/1.6 sans-serif; color: #e5e7eb; box-sizing: border-box; }
+.dn-swap-title { font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+.dn-swap-line { margin: 3px 0; }
+.dn-swap-warn { color: #f5b942; margin: 3px 0; }
+.dn-swap-ctx { opacity: .6; font-size: 11px; margin: 1px 0 1px 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dn-swap-btns { display: flex; gap: 8px; margin-top: 10px; justify-content: flex-end; }
+.dn-swap-btns button { font-size: 12px; padding: 4px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border-color,#4b5563); background: rgba(255,255,255,.06); color: var(--input-text,#e5e7eb); }
+.dn-swap-btns button:hover { background: rgba(255,255,255,.12); }
+.dn-swap-btns button.dn-primary { background: rgba(245,185,66,.2); border-color: rgba(245,185,66,.6); color: #f5b942; }
+.dn-swap-toast { position: fixed; z-index: 100103; bottom: 22px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 8px;
+  background: rgba(12,16,24,.95); border: 1px solid rgba(148,163,184,.4);
+  font: 12px/1.5 sans-serif; color: #e5e7eb; box-shadow: 0 8px 24px rgba(0,0,0,.45); }
+.dn-swap-toast button { font-size: 12px; padding: 2px 8px; border-radius: 6px; cursor: pointer;
+  border: 1px solid rgba(245,185,66,.6); background: rgba(245,185,66,.15); color: #f5b942; }
+`;
+    document.head.append(el);
+}
+
+function widgetValueOf(node, name) {
+    const w = (node?.widgets || []).find((item) => item && item.name === name);
+    return w ? w.value : undefined;
+}
+
+function cardViewUrl(name) {
+    return name ? `/view?filename=${encodeURIComponent(name)}&type=input` : "";
+}
+
+let cardPicker = null;
+
+function closeCardPicker() {
+    if (!cardPicker) return;
+    cardPicker.cleanup?.();
+    cardPicker.el?.remove();
+    cardPicker.preview?.remove();
+    cardPicker = null;
+}
+
+/** 打开选卡器：搜索栏 + 5 行可见的滚动列表（缩略图 + 资产名），排除本组已连的卡。 */
+function openCardPicker(anchor, hit) {
+    ensurePickerStyles();
+    closeCardPicker();
+    // 不选中节点直接右键圆点时，节点自己的菜单也会叠上来 —— 打开选卡器前把残留菜单清掉
+    document.querySelectorAll(".litecontextmenu").forEach((m) => m.remove());
+    const node = hit.targetNode;
+    const index = hit.index;
+    const connected = new Set(normalizeLinks(node).map((link) => Number(link.source_id)));
+    const rows = (app.graph?._nodes || [])
+        .filter((n) => n.type === "H3MediaLoader" && !connected.has(Number(n.id)))
+        .map((n) => {
+            const role = String(widgetValueOf(n, "role_name") ?? "").trim();
+            const image = String(n.properties?.pml_image_filename || widgetValueOf(n, "image_filename") || "");
+            const audio = String(n.properties?.pml_audio_filename || "");
+            return { id: Number(n.id), role, image, audio, hay: `${role} ${image}`.toLowerCase() };
+        })
+        .sort((a, b) => (a.role || "\uffff").localeCompare(b.role || "\uffff", "zh-Hans-CN"));
+
+    const el = document.createElement("div");
+    el.className = "dn-card-picker";
+    const search = document.createElement("input");
+    search.className = "dn-card-search";
+    search.placeholder = "按资产名 / 文件名搜索…";
+    const list = document.createElement("div");
+    list.className = "dn-card-list";
+    el.append(search, list);
+    const preview = document.createElement("div");
+    preview.className = "dn-card-preview";
+    document.body.append(el, preview);
+
+    const render = (query) => {
+        list.textContent = "";
+        const q = String(query || "").trim().toLowerCase();
+        const hits = rows.filter((row) => !q || row.hay.includes(q));
+        if (!hits.length) {
+            const empty = document.createElement("div");
+            empty.className = "dn-card-empty";
+            empty.textContent = "没有匹配的资产卡";
+            list.append(empty);
+            return;
+        }
+        for (const row of hits) {
+            const item = document.createElement("div");
+            item.className = "dn-card-row";
+            const hasImg = /\.(png|jpe?g|webp|bmp|gif|tiff?)$/i.test(row.image);
+            const kind = [hasImg ? "图" : null, row.audio ? "音" : null].filter(Boolean).join("+") || "空";
+            if (hasImg) {
+                const img = document.createElement("img");
+                img.className = "dn-card-thumb";
+                img.src = cardViewUrl(row.image);
+                img.alt = "";
+                item.append(img);
+                item.addEventListener("mouseenter", () => {
+                    preview.textContent = "";
+                    const big = document.createElement("img");
+                    big.src = img.src;
+                    big.alt = "";
+                    const cap = document.createElement("div");
+                    cap.className = "dn-card-preview-name";
+                    cap.textContent = row.role || row.image;
+                    preview.append(big, cap);
+                    preview.style.display = "block";
+                    const pw = 230;
+                    const px = Math.min(anchor.x + PICKER_WIDTH + 8, window.innerWidth - pw - 8);
+                    const py = Math.min(Math.max(8, item.getBoundingClientRect().top - 40), window.innerHeight - 260);
+                    preview.style.left = `${Math.max(8, px)}px`;
+                    preview.style.top = `${py}px`;
+                });
+                item.addEventListener("mouseleave", () => { preview.style.display = "none"; });
+            } else {
+                const ph = document.createElement("div");
+                ph.className = "dn-card-thumb is-audio";
+                ph.textContent = "音";
+                item.append(ph);
+            }
+            const main = document.createElement("div");
+            main.className = "dn-card-main";
+            const name = document.createElement("div");
+            name.className = "dn-card-name";
+            name.textContent = row.role || "(未命名)";
+            const sub = document.createElement("div");
+            sub.className = "dn-card-sub";
+            sub.textContent = `${kind} · ${row.image || row.audio || "无文件"}`;
+            main.append(name, sub);
+            item.append(main);
+            item.addEventListener("click", () => {
+                const at = { x: anchor.x, y: anchor.y };
+                closeCardPicker();
+                pickReplacement(node, index, row, at);
+            });
+            list.append(item);
+        }
+    };
+    render("");
+    search.addEventListener("input", () => render(search.value));
+
+    const onDocDown = (event) => {
+        if (cardPicker && !cardPicker.el.contains(event.target)) closeCardPicker();
+    };
+    const onKey = (event) => { if (event.key === "Escape") closeCardPicker(); };
+    document.addEventListener("pointerdown", onDocDown, true);
+    document.addEventListener("keydown", onKey, true);
+    const cleanup = () => {
+        document.removeEventListener("pointerdown", onDocDown, true);
+        document.removeEventListener("keydown", onKey, true);
+    };
+    cardPicker = { el, preview, cleanup };
+
+    el.style.left = `${Math.min(Math.max(8, anchor.x), Math.max(8, window.innerWidth - PICKER_WIDTH - 8))}px`;
+    el.style.top = `${Math.min(Math.max(8, anchor.y), Math.max(8, window.innerHeight - (PICKER_VISIBLE_ROWS * PICKER_ROW + 96)))}px`;
+    setTimeout(() => search.focus(), 0);
+}
+
+/** 选定一张卡：能直接换就直接换；会动提示词的先弹确认框。 */
+function pickReplacement(node, index, row, anchor) {
+    const plan = planCardSwap(node, index, row.id, 0);
+    if (!plan) { showToast("替换失败：找不到连线或卡片"); return; }
+    const needsConfirm = !plan.sameRole || plan.remaps.length > 0 || plan.warnings.length > 0;
+    if (!needsConfirm) {
+        const res = applyCardSwap(node, index, row.id, 0, "rewrite");
+        showToast(`已替换为「${row.role || "(未命名)"}」`, res?.undo);
+        return;
+    }
+    openSwapConfirm(node, index, row, plan, anchor);
+}
+
+/** 确认框：列出会动的每一处 —— 名字替换、编号重映射、警告；三个出口。 */
+function openSwapConfirm(node, index, row, plan, anchor) {
+    closeCardPicker();
+    ensurePickerStyles();
+    const oldName = plan.oldRole || "(未命名)";
+    const newName = plan.newRole || "(未命名)";
+    const el = document.createElement("div");
+    el.className = "dn-swap-dialog";
+    const title = document.createElement("div");
+    title.className = "dn-swap-title";
+    title.textContent = `替换连线：${oldName} → ${newName}`;
+    el.append(title);
+
+    if (plan.nameCount) {
+        const line = document.createElement("div");
+        line.className = "dn-swap-line";
+        line.textContent = `提示词将替换 ${plan.nameCount} 处「${plan.oldRole}」→「${plan.newRole}」：`;
+        el.append(line);
+        for (const ctx of plan.contexts) {
+            const c = document.createElement("div");
+            c.className = "dn-swap-ctx";
+            c.textContent = `…${ctx}…`;
+            el.append(c);
+        }
+    }
+    for (const r of plan.remaps) {
+        const line = document.createElement("div");
+        line.className = "dn-swap-line";
+        line.textContent = `编号变化：<${r.type} ${r.from}> → <${r.type} ${r.to}>`;
+        el.append(line);
+    }
+    for (const w of plan.warnings) {
+        const line = document.createElement("div");
+        line.className = "dn-swap-warn";
+        line.textContent = `⚠ ${w}`;
+        el.append(line);
+    }
+
+    const btns = document.createElement("div");
+    btns.className = "dn-swap-btns";
+    const make = (label, cls, fn) => {
+        const b = document.createElement("button");
+        b.textContent = label;
+        if (cls) b.className = cls;
+        b.addEventListener("click", () => { el.remove(); fn(); });
+        return b;
+    };
+    const finish = (res, label) => {
+        const parts = [`已替换为「${newName}」`];
+        if (res?.nameCount) parts.push(`改了 ${res.nameCount} 处资产名`);
+        if (res?.remaps?.length) parts.push(`重映射 ${res.remaps.length} 个编号`);
+        showToast(parts.join("，"), res?.undo, label === "link-only");
+    };
+    btns.append(make("替换并改提示词", "dn-primary", () => finish(applyCardSwap(node, index, row.id, 0, "rewrite"), "rewrite")));
+    btns.append(make("只换连线", "", () => finish(applyCardSwap(node, index, row.id, 0, "link-only"), "link-only")));
+    btns.append(make("取消", "", () => {}));
+    el.append(btns);
+
+    const onKey = (event) => { if (event.key === "Escape") { el.remove(); document.removeEventListener("keydown", onKey, true); } };
+    document.addEventListener("keydown", onKey, true);
+    el.addEventListener("click", (event) => event.stopPropagation());
+    document.body.append(el);
+    const dw = 400;
+    el.style.left = `${Math.min(Math.max(8, (anchor?.x ?? 100)), Math.max(8, window.innerWidth - dw - 8))}px`;
+    el.style.top = `${Math.min(Math.max(8, (anchor?.y ?? 100)), Math.max(8, window.innerHeight - 240))}px`;
+}
+
+/** 换完的提示条：可撤销，12 秒后自己消失。 */
+function showToast(text, undo, isLinkOnly) {
+    document.querySelectorAll(".dn-swap-toast").forEach((item) => item.remove());
+    ensurePickerStyles();
+    const el = document.createElement("div");
+    el.className = "dn-swap-toast";
+    const span = document.createElement("span");
+    span.textContent = isLinkOnly ? `${text}（提示词未自动修改）` : text;
+    el.append(span);
+    if (undo) {
+        const btn = document.createElement("button");
+        btn.textContent = "撤销";
+        btn.addEventListener("click", () => { undo(); el.remove(); });
+        el.append(btn);
+    }
+    document.body.append(el);
+    setTimeout(() => el.remove(), 12000);
+}
