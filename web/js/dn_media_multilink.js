@@ -673,6 +673,8 @@ function ensurePickerStyles() {
 .dn-swap-line { margin: 3px 0; }
 .dn-swap-warn { color: #f5b942; margin: 3px 0; }
 .dn-swap-ctx { opacity: .6; font-size: 11px; margin: 1px 0 1px 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dn-swap-check { display: flex; align-items: center; gap: 6px; margin-top: 8px; cursor: pointer; }
+.dn-swap-check input { accent-color: #f5b942; }
 .dn-swap-btns { display: flex; gap: 8px; margin-top: 10px; justify-content: flex-end; }
 .dn-swap-btns button { font-size: 12px; padding: 4px 10px; border-radius: 6px; cursor: pointer;
   border: 1px solid var(--border-color,#4b5563); background: rgba(255,255,255,.06); color: var(--input-text,#e5e7eb); }
@@ -822,20 +824,40 @@ function openCardPicker(anchor, hit) {
 }
 
 /** 选定一张卡：能直接换就直接换；会动提示词的先弹确认框。 */
+/** 找出**其它组**里连着同一张卡的连线（多组联动替换用）。
+ *  跳过「已连着新卡」的组 —— 换上去会被 normalizeLinks 按 卡:槽 去重，静默丢一条。 */
+function findOtherOccurrences(node, outId, toId) {
+    const out = [];
+    let skippedDup = 0;
+    for (const n of app.graph?._nodes || []) {
+        if (!n || n === node || n.type !== NODE_CLASS) continue;
+        const links = normalizeLinks(n);
+        links.forEach((link, index) => {
+            if (Number(link.source_id) !== Number(outId)) return;
+            if (links.some((l) => Number(l.source_id) === Number(toId))) { skippedDup += 1; return; }
+            out.push({ node: n, index });
+        });
+    }
+    return { others: out, skippedDup };
+}
+
 function pickReplacement(node, index, row, anchor) {
+    const links = normalizeLinks(node);
+    const outId = Number(links[index]?.source_id);
+    const { others, skippedDup } = findOtherOccurrences(node, outId, row.id);
     const plan = planCardSwap(node, index, row.id, 0);
     if (!plan) { showToast("替换失败：找不到连线或卡片"); return; }
-    const needsConfirm = !plan.sameRole || plan.remaps.length > 0 || plan.warnings.length > 0;
+    const needsConfirm = !plan.sameRole || plan.remaps.length > 0 || plan.warnings.length > 0 || others.length > 0;
     if (!needsConfirm) {
         const res = applyCardSwap(node, index, row.id, 0, "rewrite");
         showToast(`已替换为「${row.role || "(未命名)"}」`, res?.undo);
         return;
     }
-    openSwapConfirm(node, index, row, plan, anchor);
+    openSwapConfirm(node, index, row, plan, anchor, others, skippedDup);
 }
 
-/** 确认框：列出会动的每一处 —— 名字替换、编号重映射、警告；三个出口。 */
-function openSwapConfirm(node, index, row, plan, anchor) {
+/** 确认框：列出会动的每一处 —— 名字替换、编号重映射、警告、多组联动；三个出口。 */
+function openSwapConfirm(node, index, row, plan, anchor, others, skippedDup) {
     closeCardPicker();
     ensurePickerStyles();
     const oldName = plan.oldRole || "(未命名)";
@@ -872,6 +894,22 @@ function openSwapConfirm(node, index, row, plan, anchor) {
         el.append(line);
     }
 
+    // 多组联动：同一张卡还连在别的组里 → 勾选就一起换（每个组各自的提示词各自重写）
+    let linkOthers = null;
+    if (others.length) {
+        const label = document.createElement("label");
+        label.className = "dn-swap-check";
+        linkOthers = document.createElement("input");
+        linkOthers.type = "checkbox";
+        label.append(linkOthers, document.createTextNode(` 同时替换其它组里的同一张卡（${others.length} 处，各自改提示词）`));
+        el.append(label);
+    } else if (skippedDup) {
+        const line = document.createElement("div");
+        line.className = "dn-swap-ctx";
+        line.textContent = `（另有 ${skippedDup} 个组已连着新卡，跳过不动）`;
+        el.append(line);
+    }
+
     const btns = document.createElement("div");
     btns.className = "dn-swap-btns";
     const make = (label, cls, fn) => {
@@ -881,14 +919,29 @@ function openSwapConfirm(node, index, row, plan, anchor) {
         b.addEventListener("click", () => { el.remove(); fn(); });
         return b;
     };
-    const finish = (res, label) => {
-        const parts = [`已替换为「${newName}」`];
-        if (res?.nameCount) parts.push(`改了 ${res.nameCount} 处资产名`);
-        if (res?.remaps?.length) parts.push(`重映射 ${res.remaps.length} 个编号`);
-        showToast(parts.join("，"), res?.undo, label === "link-only");
+    const runSwap = (mode) => {
+        const undos = [];
+        let names = 0;
+        let remapTotal = 0;
+        let groups = 0;
+        const apply = (n, i) => {
+            const res = applyCardSwap(n, i, row.id, 0, mode);
+            if (!res) return;
+            groups += 1;
+            names += res.nameCount || 0;
+            remapTotal += res.remaps?.length || 0;
+            if (res.undo) undos.push(res.undo);
+        };
+        apply(node, index);
+        if (linkOthers?.checked) for (const occ of others) apply(occ.node, occ.index);
+        const undo = undos.length ? () => { for (const u of undos.reverse()) u(); } : null;
+        const parts = [`已替换 ${groups} 个组为「${newName}」`];
+        if (names) parts.push(`改了 ${names} 处资产名`);
+        if (remapTotal) parts.push(`重映射 ${remapTotal} 个编号`);
+        showToast(parts.join("，"), undo, mode === "link-only");
     };
-    btns.append(make("替换并改提示词", "dn-primary", () => finish(applyCardSwap(node, index, row.id, 0, "rewrite"), "rewrite")));
-    btns.append(make("只换连线", "", () => finish(applyCardSwap(node, index, row.id, 0, "link-only"), "link-only")));
+    btns.append(make("替换并改提示词", "dn-primary", () => runSwap("rewrite")));
+    btns.append(make("只换连线", "", () => runSwap("link-only")));
     btns.append(make("取消", "", () => {}));
     el.append(btns);
 
