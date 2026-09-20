@@ -20,7 +20,7 @@ from .nodes import NODE_DISPLAY_NAME_MAPPINGS as _GROUP_NAMES
 NODE_CLASS_MAPPINGS = {**_CARD_NODES, **_GROUP_NODES}
 NODE_DISPLAY_NAME_MAPPINGS = {**_CARD_NAMES, **_GROUP_NAMES}
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # 前端扩展目录（ComfyUI 会把这里的每个 js 都加载一遍）：
 #   asset_card.js           资产卡节点的自绘 UI
