@@ -1,6 +1,6 @@
 import { app } from "../../../scripts/app.js";
-import { addForegroundPainter, addHandleProvider, drawVirtualDot, PAINTER_TOP, VIRTUAL_DOT_INACTIVE } from "./dn_overlay.js";
-import { refreshPromptMedia, getLinkBadges, planCardSwap, applyCardSwap } from "./dn_prompt_rich.js";
+import { addForegroundPainter, addHandleProvider, drawVirtualDot, PAINTER_TOP, VIRTUAL_DOT_INACTIVE, VIRTUAL_DOT_NO_AUDIO } from "./dn_overlay.js";
+import { refreshPromptMedia, getLinkBadges, planCardSwap, applyCardSwap, isNoneName } from "./dn_prompt_rich.js";
 
 /*
  * 资产卡 to Director Group —— medias 单端口多连线。
@@ -16,13 +16,38 @@ import { refreshPromptMedia, getLinkBadges, planCardSwap, applyCardSwap } from "
  *     - 你往这个端口再拖第二条线时：先把你原本那条（可能刚被前端顶掉）收编成第 1 条，
  *       新线排第 2 条，一条都不丢；
  *     - 只有当虚拟列表非空时，才把 medias 改写成 media_1..N。
+ *
+ * 段级音频开关（2026-09-21 加）：
+ *   右键连线中点圆点 →「本段不带音」。只在本节点的连线记录里写一个 ``skip_audio``，
+ *   注入 prompt 时拼成 ``link_audio_mask``（"101"，与 media_1..N 逐位对齐），
+ *   由后端 media_group_core.apply_audio_mask 在**过滤之前**把对应卡片的 audio 摘掉。
+ *   为什么不在前端"注入时直接把 audio 抹掉"：注入的是 ``[source_id, slot]`` 这种**真链接**，
+ *   前端改不了上游输出的内容 —— 只能让后端按掩码自己摘。
+ *   为什么要段级：上游卡片的 ``audio_muted`` 是卡级属性，会影响引用它的**所有**段。
  */
 
 const NODE_CLASS = "DNMediaToDirectorGroup";
 const MEDIA_INPUT = "medias";
-const BACKING_RE = /^media_[1-9]$/;
 const MAX_MEDIA = 9;
 const LINKS_PROPERTY = "dn_media_to_group_links";
+/* 段级音频开关的隐藏输入名（后端 nodes.py 的 INPUT_AUDIO_MASK）。
+   按**连线顺序**拼成 "101" 这样的串注入：第 i 位对应第 i+1 条连线，'0' = 这条不带音。 */
+const AUDIO_MASK_INPUT = "link_audio_mask";
+/* 要从前端节点定义里剔掉的隐藏输入：媒体槽 + 音频掩码。
+   后端声明它们只为让注入的 prompt 输入名合法，界面上一个字都不该露。 */
+const HIDDEN_INPUT_NAMES = new Set([
+    ...Array.from({ length: MAX_MEDIA }, (_unused, index) => `media_${index + 1}`),
+    AUDIO_MASK_INPUT,
+]);
+
+function isHiddenInputName(name) {
+    return HIDDEN_INPUT_NAMES.has(String(name || ""));
+}
+
+/** 一条连线上「本段不带音」是否打开。 */
+function isAudioSkipped(link) {
+    return Boolean(link?.skip_audio);
+}
 
 /* 中点圆点的可点范围与透明把手的边长：圆点半径见 dn_overlay.js 的 VIRTUAL_DOT.radius（11）。
    两者比圆点本身大一圈，方便点。 */
@@ -106,12 +131,12 @@ function syncNative(node) {
     };
 }
 
-/** 删除前端定义里的隐藏传输输入，避免它们出现在节点上。 */
+/** 删除前端定义里的隐藏传输输入（media_1..9 与段级音频掩码），避免它们出现在节点上。 */
 function trimNodeDefinition(nodeData) {
     const remove = (container) => {
         if (!container || typeof container !== "object") return;
         for (const name of Object.keys(container)) {
-            if (BACKING_RE.test(name)) delete container[name];
+            if (isHiddenInputName(name)) delete container[name];
         }
     };
     remove(nodeData?.input?.required);
@@ -120,11 +145,11 @@ function trimNodeDefinition(nodeData) {
     remove(nodeData?.optional);
     for (const key of ["required", "optional"]) {
         if (Array.isArray(nodeData?.input_order?.[key])) {
-            nodeData.input_order[key] = nodeData.input_order[key].filter((name) => !BACKING_RE.test(String(name)));
+            nodeData.input_order[key] = nodeData.input_order[key].filter((name) => !isHiddenInputName(name));
         }
     }
     if (Array.isArray(nodeData?.inputs)) {
-        nodeData.inputs = nodeData.inputs.filter((input) => !BACKING_RE.test(String(input?.name || input?.id || input)));
+        nodeData.inputs = nodeData.inputs.filter((input) => !isHiddenInputName(input?.name || input?.id || input));
     }
 }
 
@@ -237,7 +262,15 @@ function drawVirtualLinks(canvas, ctx, options) {
             }
             if (!linesOnly) {
                 const label = badge ? badge.label : String(index + 1);
-                drawVirtualDot(ctx, midX, midY, label, off ? VIRTUAL_DOT_INACTIVE : undefined);
+                // 圆点三态（颜色只在"你该不该注意它"上区分）：
+                //   灰   = 后端把这张卡整张丢了（资产名不在提示词里）—— 故障
+                //   琥珀 = 图照送、但这条连线的**音本段不送**（卡片静音 or 段级开关）—— 你的选择
+                //   绿   = 照常
+                // 连线本身只有"被丢"才变灰虚线；关掉的只是音，图还在送，线不该跟着变虚。
+                const style = off
+                    ? VIRTUAL_DOT_INACTIVE
+                    : (badge?.audioOff ? VIRTUAL_DOT_NO_AUDIO : undefined);
+                drawVirtualDot(ctx, midX, midY, label, style);
             }
         }
     }
@@ -284,6 +317,7 @@ function virtualLinkHandles(canvas, toScreen) {
         if (!isNodeSelected(canvas, target)) continue;
         const targetPoint = getMediaPosition(target);
         if (!targetPoint) continue;
+        const badges = getLinkBadges(target);
         normalizeLinks(target).forEach((item, index) => {
             const sourceNode = getNode(graph, item.source_id);
             const sourcePoint = getOutputPosition(sourceNode, Number(item.source_slot));
@@ -291,12 +325,16 @@ function virtualLinkHandles(canvas, toScreen) {
             const mid = [(sourcePoint[0] + targetPoint[0]) / 2, (sourcePoint[1] + targetPoint[1]) / 2];
             const screen = toScreen(mid);
             const open = (event) => openLinkMenu(canvas, { targetNode: target, index, point: mid }, event);
+            // 悬停就要能看出"这条音是关着的"，不用去点菜单确认
+            const badge = badges.get(Number(item.source_id));
+            const state = badge?.muted ? "卡片已静音" : (badge?.skipAudio ? "本段不带音" : "");
             out.push({
                 key: `${target.id}:${index}`,
                 x: screen[0],
                 y: screen[1],
                 size: HANDLE_SIZE,
-                title: `第 ${index + 1} 条连线（右键：序号提前 / 序号退后 / 删除）`,
+                title: `第 ${index + 1} 条连线${state ? `｜${state}` : ""}`
+                    + "（右键：本段带音 / 不带音、序号提前 / 退后、删除、替换这张卡）",
                 onActivate: open,
                 onMenu: open,
             });
@@ -379,6 +417,28 @@ function moveVirtualLink(node, index, delta) {
     return true;
 }
 
+/** 设置第 index 条连线的**音频**开关（段级）。图照旧送，编号也不变。
+ *
+ *  为什么需要段级：卡片自己的 ``audio_muted`` 是**卡级**属性，一勾静音，引用这张卡的
+ *  **所有段**都失去音色参考；而实际需求常常是「A 段要他的音色、B 段不要」。
+ *  这里只改**本节点**这条连线记录里的 ``skip_audio`` —— 上游卡片一个字节都不动
+ *  （尤其不能去改它，那张卡还被同一段里的别的节点共用着）。
+ *  真正的摘音在后端做（media_group_core.apply_audio_mask）。 */
+function setLinkAudio(targetNode, index, skip) {
+    const links = normalizeLinks(targetNode);
+    if (index < 0 || index >= links.length) return false;
+    links[index].skip_audio = Boolean(skip);
+    writeLinks(targetNode, links);
+    return true;
+}
+
+/** 翻转第 index 条连线的音频开关。 */
+function toggleLinkAudio(targetNode, index) {
+    const links = normalizeLinks(targetNode);
+    if (index < 0 || index >= links.length) return false;
+    return setLinkAudio(targetNode, index, !isAudioSkipped(links[index]));
+}
+
 /** 在虚拟连线位置打开删除菜单。 */
 function openLinkMenu(canvas, hit, event) {
     const anchor = getClientPosition(canvas, hit.point) || { x: event?.clientX || 0, y: event?.clientY || 0 };
@@ -392,11 +452,22 @@ function openLinkMenu(canvas, hit, event) {
     };
     const run = (fn) => () => { fn(); close(); };
     if (globalThis.LiteGraph?.ContextMenu) {
-        const count = normalizeLinks(hit.targetNode).length;
+        const links = normalizeLinks(hit.targetNode);
+        const count = links.length;
+        const link = count > hit.index ? links[hit.index] : null;
         const items = [];
         if (count > 1) {
             items.push({ content: "序号提前", callback: run(() => moveVirtualLink(hit.targetNode, hit.index, -1)) });
             items.push({ content: "序号退后", callback: run(() => moveVirtualLink(hit.targetNode, hit.index, +1)) });
+            items.push(null);
+        }
+        // 只有上游这张卡**真的有音**时才给这个开关 —— 没音的卡摆一个"不带音"是噪声。
+        if (link && cardHasAudio(hit.targetNode, link)) {
+            const skipped = isAudioSkipped(link);
+            items.push({
+                content: skipped ? "本段带音（恢复）" : "本段不带音",
+                callback: run(() => toggleLinkAudio(hit.targetNode, hit.index)),
+            });
             items.push(null);
         }
         items.push({ content: "删除这条连线", callback: run(() => removeVirtualLink(hit.targetNode, hit.index)) });
@@ -404,6 +475,18 @@ function openLinkMenu(canvas, hit, event) {
         items.push({ content: "替换这张卡…", callback: run(() => openCardPicker(anchor, hit)) });
         menuInstance = new globalThis.LiteGraph.ContextMenu(items, { event: menuEvent });
     }
+}
+
+/** 这条连线的上游卡片是不是真的挂了音频文件（没挂就没必要给"不带音"开关）。 */
+function cardHasAudio(targetNode, link) {
+    const source = getNode(targetNode?.graph || app.graph, link?.source_id);
+    const props = source?.properties || {};
+    const value = props.pml_audio_filename;
+    if (typeof value === "string" && value.trim() && !isNoneName(value)) return true;
+    const widget = (source?.widgets || []).find((item) => item && /audio|sound/i.test(item.name || "")
+        && !/mute/i.test(item.name || ""));
+    const raw = typeof widget?.value === "object" ? widget?.value?.filename : widget?.value;
+    return typeof raw === "string" && raw.trim() && !isNoneName(raw);
 }
 
 /** 判断当前画布是否正在创建新的媒体连线。 */
@@ -495,14 +578,25 @@ function patchGraphToPrompt() {
             if (!promptNode) continue;
             promptNode.inputs ||= {};
             for (let index = 1; index <= MAX_MEDIA; index += 1) delete promptNode.inputs[`media_${index}`];
+            delete promptNode.inputs[AUDIO_MASK_INPUT];
             let mediaIndex = 1;
+            /* 段级音频掩码：与 media_1..N **在同一次循环里 push**，逐位对齐。
+               顺序一旦分家，'0' 就会落到别的卡头上（那正好是"关错人"的经典 bug）。 */
+            const mask = [];
             for (const link of links) {
                 // 被忽略（mute / bypass）的上游不会出现在最终 prompt 里，不能继续作为后端连接提交。
                 if (!Object.prototype.hasOwnProperty.call(prompt, String(link.source_id))) continue;
                 promptNode.inputs[`media_${mediaIndex}`] = [String(link.source_id), Number(link.source_slot)];
+                mask.push(isAudioSkipped(link) ? "0" : "1");
                 mediaIndex += 1;
             }
-            if (mediaIndex > 1) delete promptNode.inputs.medias;
+            if (mediaIndex > 1) {
+                delete promptNode.inputs.medias;
+                // 全 1 就不注入：老工作流/API 调用看到的 prompt 与加这个功能之前完全一样。
+                if (mask.some((bit) => bit === "0")) {
+                    promptNode.inputs[AUDIO_MASK_INPUT] = mask.join("");
+                }
+            }
         }
         return output;
     };
@@ -722,8 +816,13 @@ function openCardPicker(anchor, hit) {
         .filter((n) => n.type === "H3MediaLoader" && !connected.has(Number(n.id)))
         .map((n) => {
             const role = String(widgetValueOf(n, "role_name") ?? "").trim();
-            const image = String(n.properties?.pml_image_filename || widgetValueOf(n, "image_filename") || "");
-            const audio = String(n.properties?.pml_audio_filename || "");
+            // 资产卡没选图时 properties 里是哨兵值 "(none)" —— 不认它就会把 "(none)"
+            // 当成文件名（搜索结果里多一个假文件名、缩略图去请求一个不存在的图片）。
+            let rawImage = n.properties?.pml_image_filename;
+            if (isNoneName(rawImage)) rawImage = widgetValueOf(n, "image_filename");
+            const image = isNoneName(rawImage) ? "" : String(rawImage);
+            const rawAudio = n.properties?.pml_audio_filename;
+            const audio = isNoneName(rawAudio) ? "" : String(rawAudio);
             return { id: Number(n.id), role, image, audio, hay: `${role} ${image}`.toLowerCase() };
         })
         .sort((a, b) => (a.role || "\uffff").localeCompare(b.role || "\uffff", "zh-Hans-CN"));

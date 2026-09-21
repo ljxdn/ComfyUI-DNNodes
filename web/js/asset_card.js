@@ -13,6 +13,7 @@
  */
 
 import { app } from "../../../scripts/app.js";
+import { addForegroundPainter } from "./dn_overlay.js";
 
 /* =====================================================================
 资产卡 前端（节点类名仍是 H3MediaLoader，改动只为界面观感）
@@ -180,6 +181,11 @@ app.registerExtension({
 
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== NODE_CLASS) return;
+        // 标题栏大号资产名画在 DOM 覆盖层上（节点自己的 onDrawForeground 到不了标题栏）
+        if (!window.__dnCardBadgeRegistered) {
+            window.__dnCardBadgeRegistered = true;
+            addForegroundPainter("dn.assetcard.rolebadge", paintRoleNameBadges);
+        }
 
         const origOnNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
@@ -700,6 +706,79 @@ function setRoleName(node, value) {
     widget.value = value;
     markGraphDirty(node);
     try { app.graph?.afterChange?.(); } catch (e) {}
+}
+
+/* ------------------------------------------------------------------
+ * 标题栏上的大号资产名
+ *
+ * 节点标题栏右边本来就空着（标题只有「资产卡」三个字），把「资产名」用大一号的
+ * 字画在那片空白里 —— 卡片一多，不点开也能一眼认出哪张是谁。
+ * 画在 onDrawForeground 里（节点本地坐标系，y 为负就是标题栏那 30px），
+ * 位置/配色都跟着主题走；资产名改一个字就即时重画（setRoleName → markGraphDirty）。
+ * ------------------------------------------------------------------ */
+
+const ROLE_BADGE_FONT_SIZE = 20;         // 画布单位。节点标题是 14，这里刻意大一号
+const ROLE_BADGE_TOP = 26;               // 文字中线距**节点体顶边**（= 标题栏下沿）的距离
+const ROLE_BADGE_LEFT = 14;              // 左对齐：与节点标题同一起点
+const ROLE_BADGE_RIGHT_RESERVE = 110;    // 右侧让开输出口标签（media / image / audio / prompt）
+
+/** 取这张卡当前的资产名（读隐藏的原生控件 role_name）。 */
+function roleNameOf(node) {
+    const widget = findWidget(node, "role_name");
+    const raw = widget ? widget.value : node?.properties?.pml_role_name;
+    return String(raw ?? "").trim();
+}
+
+/** 超宽就用 … 截断（把省略号本身的宽度也算进去）。 */
+function fitBadgeText(ctx, text, maxWidth) {
+    if (ctx.measureText(text).width <= maxWidth) return text;
+    let cut = text;
+    while (cut.length > 1 && ctx.measureText(`${cut}…`).width > maxWidth) cut = cut.slice(0, -1);
+    return `${cut}…`;
+}
+
+/** 在标题栏右侧画资产名。**画布坐标系**（与节点 pos 同一套），画在 DOM 覆盖层上。
+ *
+ *  为什么不用节点自己的 onDrawForeground：那层被裁在节点体内，标题栏那 30px 画不进去
+ *  （实测：写在 onDrawForeground 里完全看不见）。覆盖层是唯一能盖住标题栏的层 ——
+ *  上游高亮描边也是这么画到标题栏上的。 */
+function paintRoleNameBadges(ctx, canvas) {
+    const graph = canvas?.graph || app.graph;
+    if (!ctx || !graph?._nodes) return;
+    const ds = canvas?.ds || {};
+    const titleHeight = Number(globalThis.LiteGraph?.NODE_TITLE_HEIGHT) || 30;
+    // 视口裁剪：只画看得见的节点（每帧对每张卡量一次字宽，别浪费在屏幕外）
+    const k = (Number(ds.scale) || 1) * (globalThis.devicePixelRatio || 1);
+    const viewW = (canvas.canvas?.width || 0) / k;
+    const viewH = (canvas.canvas?.height || 0) / k;
+    const vx = -(Number(ds.offset?.[0]) || 0);
+    const vy = -(Number(ds.offset?.[1]) || 0);
+    for (const node of graph._nodes || []) {
+        if (node?.comfyClass !== NODE_CLASS && node?.type !== NODE_CLASS) continue;
+        if (node?.flags?.collapsed) continue;
+        const pos = node.pos;
+        const width = Number(node.size?.[0]) || NODE_WIDTH;
+        if (!pos) continue;
+        if (pos[0] + width < vx - 40 || pos[0] > vx + viewW + 40) continue;
+        if (pos[1] < vy - 40 || pos[1] - titleHeight > vy + viewH + 40) continue;
+        const name = roleNameOf(node);
+        if (!name) continue;
+        // 位置：节点标题栏**下边**那一行 —— 标题栏下方约 120 单位本来是空的（原生图片预览
+        // 占位留下的），左对齐起笔（与节点标题同一 x），右侧给输出口标签让位。
+        const left = pos[0] + ROLE_BADGE_LEFT;
+        const maxWidth = (pos[0] + width - ROLE_BADGE_RIGHT_RESERVE) - left;
+        if (maxWidth < 24) continue;
+        ctx.save();
+        ctx.font = `bold ${ROLE_BADGE_FONT_SIZE}px -apple-system, "Segoe UI", Arial, sans-serif`;
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        // 浅色 + 深色描影：节点体是深色，浅色字清楚；浅底主题下描影兜底。
+        ctx.fillStyle = "#f2f5f8";
+        ctx.shadowColor = "rgba(0, 0, 0, 0.62)";
+        ctx.shadowBlur = 3;
+        ctx.fillText(fitBadgeText(ctx, name, maxWidth), left, pos[1] + ROLE_BADGE_TOP);
+        ctx.restore();
+    }
 }
 
 /** 写入最长边到隐藏的原生控件（空输入不写回，避免打字中途变成默认值）。 */

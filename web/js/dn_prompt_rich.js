@@ -39,6 +39,15 @@ const RAW_CLASS = "dnp-raw";
 const OFF_CLASS = "dnp-off";
 const PREVIEW_ID = "dnp-hover-preview";
 const RAW_PROP = "dn_prompt_raw_mode";
+/* 资产卡的「静音」开关：控件名与它镜像到 properties 的键。
+   出处 asset_card.js（PROP_AUDIO_MUTED / setAudioMuted）。勾了静音 → 卡片输出的
+   media.audio 直接是 None，后端根本收不到这条音 —— 前端计数必须跟着认它。 */
+const WIDGET_AUDIO_MUTED = "audio_muted";
+const PROP_AUDIO_MUTED = "pml_audio_muted";
+/* H3 的素材上限（与后端 media_group_core.MAX_REFERENCE_* 保持一致）。
+   音频超上限 → 后端截断保留前 N 条；图片超上限 → 后端直接报错（口径不同，别统一）。 */
+const MAX_IMAGES = 9;
+const MAX_AUDIOS = 3;
 
 /* 六段式标题（H3 规范；Ref2VA 用前六个，T2V 用 integrated_multimodal_description） */
 const HEADINGS = [
@@ -223,7 +232,8 @@ function virtualSources(node) {
         for (const item of props[key]) {
             const id = Number(item?.source_id);
             const src = Number.isFinite(id) ? (node.graph || app.graph)?.getNodeById?.(id) : null;
-            if (src) out.push({ node: src, slot: Number(item?.source_slot) || 0 });
+            // skip：这条连线被「本段不带音」关掉了音频（段级开关，存着而不是改上游）。
+            if (src) out.push({ node: src, slot: Number(item?.source_slot) || 0, skip: Boolean(item?.skip_audio) });
         }
     }
     return out;
@@ -251,7 +261,7 @@ function flattenCards(node) {
         for (const src of sources) {
             if (!src.node || visited.has(`${src.node.id}:${src.slot}`)) continue;
             visited.add(`${src.node.id}:${src.slot}`);
-            cards.push({ node: src.node, slot: src.slot });
+            cards.push({ node: src.node, slot: src.slot, skip: Boolean(src.skip) });
             // H3MediaPrompt / H3MediaToVideo 这类"汇总节点"：它自己的虚拟连线就是它吃进去的卡
             if (virtualSources(src.node).length && !seenNode.has(src.node.id)) {
                 seenNode.add(src.node.id);
@@ -267,24 +277,62 @@ function widgetValue(node, name) {
     return w ? w.value : undefined;
 }
 
-/** 一张卡上的图 / 音 / 资产名。 */
+/** 资产卡"没选文件"的哨兵值：`(none)` / `none` / `None` / 空串。
+ *
+ *  出处：asset_card.js 的 `IMAGE_NONE = "(none)"` 与它的 `isEmptyImage()` ——
+ *  资产卡没选图时会把 `(none)` 写进 `properties.pml_image_filename`。
+ *  ⚠️ 不认这个哨兵就会把"没图的卡"当成"有一张图的卡"：编辑器的编号、
+ *  画布上的引用状态、拆分节点的口数会一起凭空多出来（实测踩到过）。 */
+export function isNoneName(value) {
+    const text = String(value ?? "").trim();
+    return text === "" || text.toLowerCase() === "(none)" || text.toLowerCase() === "none";
+}
+
+/** 一张卡上的图 / 音 / 资产名，以及**这条音到底送不送**。
+ *
+ *  `audio` = 最终会被送进分组的那条音（空串 = 不送）。两个来源会让它变空：
+ *    · 卡片自己勾了静音（`audio_muted`）—— **卡级**，引用这张卡的所有段一起失去音色；
+ *    · 这条连线被关掉了音频（`skip_audio`）—— **段级**，只影响当前这个节点。
+ *  下游一律按 `audio` 算（编号、@ 菜单、拆分节点口数），这样界面上的字永远等于后端
+ *  真正会拿到的素材 —— 踩过"前端报 1 音、后端一条都没有"的坑，不能再让两处口径分家。
+ *  `audioName` 保留原始文件名，给"这张卡有音但被关掉了"的显示用。 */
 function cardInfo(card) {
     const node = card.node;
     const props = node?.properties || {};
     const role = String(widgetValue(node, "role_name") ?? props.pml_role_name ?? "").trim();
-    let image = props.pml_image_filename || "";
-    let audio = props.pml_audio_filename || "";
+    let image = isNoneName(props.pml_image_filename) ? "" : String(props.pml_image_filename).trim();
+    let audio = isNoneName(props.pml_audio_filename) ? "" : String(props.pml_audio_filename).trim();
     if (!image) {
         const w = (node.widgets || []).find((item) => item && /image|file/i.test(item.name || ""));
         const value = typeof w?.value === "object" ? w?.value?.filename : w?.value;
-        if (typeof value === "string" && /\.(png|jpe?g|webp|bmp|gif|tiff?)$/i.test(value)) image = value;
+        if (typeof value === "string" && !isNoneName(value) && /\.(png|jpe?g|webp|bmp|gif|tiff?)$/i.test(value)) {
+            image = value;
+        }
     }
     if (!audio) {
-        const w = (node.widgets || []).find((item) => item && /audio|sound/i.test(item.name || ""));
+        // ⚠️ 别让 /audio/i 撞上 `audio_muted` 那个布尔控件（它就是含 "audio" 的）：
+        //    撞上会把 false 当文件名、把 true 当成"有音"，两种都错。
+        const w = (node.widgets || []).find((item) => item && /audio|sound/i.test(item.name || "")
+            && !/mute/i.test(item.name || ""));
         const value = typeof w?.value === "object" ? w?.value?.filename : w?.value;
-        if (typeof value === "string" && /\.(mp3|wav|flac|ogg|m4a|aac)$/i.test(value)) audio = value;
+        if (typeof value === "string" && !isNoneName(value) && /\.(mp3|wav|flac|ogg|m4a|aac)$/i.test(value)) {
+            audio = value;
+        }
     }
-    return { node, role, image: String(image || ""), audio: String(audio || "") };
+    let muted = widgetValue(node, WIDGET_AUDIO_MUTED);
+    if (muted === undefined || muted === null) muted = props[PROP_AUDIO_MUTED];
+    muted = Boolean(muted);
+    const skipAudio = Boolean(card.skip);
+    const audioName = String(audio || "");
+    return {
+        node,
+        role,
+        image: String(image || ""),
+        audio: (muted || skipAudio) ? "" : audioName,
+        audioName,
+        muted,
+        skipAudio,
+    };
 }
 
 function viewUrl(filename) {
@@ -309,7 +357,10 @@ function promptTextOf(node) {
  *  由编辑框上方的琥珀色提示条显形（updateFilterWarn）。
  *
  *  两个有意的偏差（改后端规则时要回头看这里）：
- *  ① 提示词为空时不过滤 —— 后端此时本来也跑不起来（"至少需要一段提示词…"），别让编辑器闪着吓人；
+ *  ① 提示词为空时**不产生 filteredOut** —— 后端此时本来也跑不起来（"至少需要一段提示词…"），
+ *     别让编辑框上方那条琥珀提示闪着吓人。注意这只管"提示条 + 编号"，**画布上的引用状态**
+ *     不走这里（见 getLinkBadges / getFilteredSourceIds）：空提示词 = 一张都没引用，画灰虚线。
+ *     两处口径的差别是故意的 —— 提示条说的是"这张卡被后端丢了"，而空提示词时后端根本没跑。
  *  ② 提示词拿不到（转成了输入连线）时不过滤 —— 无法判断就别装能判断。 */
 function resolveMedia(node) {
     const promptText = promptTextOf(node);
@@ -327,6 +378,8 @@ function resolveMedia(node) {
     const pictures = [];
     const audios = [];
     const assets = [];
+    /* 有音、但这条音被关掉（卡片静音 or 本段不带音）的卡 —— 只用于提示，不参与编号。 */
+    const audiosOff = [];
     for (const { info } of kept) {
         if (info.image) {
             pictures.push({
@@ -344,18 +397,97 @@ function resolveMedia(node) {
                 role: info.role,
                 sourceNode: info.node,
             });
+        } else if (info.audioName) {
+            audiosOff.push({
+                filename: info.audioName,
+                role: info.role,
+                sourceNode: info.node,
+                muted: info.muted,
+                skipAudio: info.skipAudio,
+            });
         }
     }
+    // H3 只收得下 MAX_AUDIOS 条音：超出的**后端不会收**（截断保留前 MAX_AUDIOS 条），
+    // 所以编号到此为止 —— 编辑器里绝不能出现 <Audio 4>（它在后端根本不存在）。
+    const audioOverflow = audios.splice(MAX_AUDIOS);
+    const imageOverflow = Math.max(0, pictures.length - MAX_IMAGES);
     // 资产名清单取**全部**卡（含被过滤的）：@ 菜单里点一下名字写进提示词，这张卡就回来了。
     for (const { info } of entries) {
         if (info.role && !assets.includes(info.role)) assets.push(info.role);
     }
     return {
         pictures, videos: [], audios, assets,
+        audiosOff,
+        audioOverflow,
+        imageOverflow,
+        overflowImages: pictures.slice(MAX_IMAGES),
         colors: buildAssetColors(assets),
         filteredOut,
         promptKnown: Boolean(promptText),
     };
+}
+
+/** 后端会真正打包进 group 的素材**数量**：{ image, video, audio, known, filtered, cards }。
+ *
+ *  给 dn_group_split.js 用（资产卡Group拆分节点据此决定开几个输出口）——
+ *  **严格复刻后端 build_r2v_group → filter_unused_role_medias 的结果**：
+ *  资产名（role_name）非空的卡，必须出现在提示词文本里，否则**整张卡**（图 + 音）丢掉。
+ *  所以「提示词还空着」时，带资产名的卡一张都不会进分组 → 数量 0 ——
+ *  与后端一致（此时后端还会直接 raise「至少需要一段提示词，或一组参考图 / 参考音频」，
+ *  压根产不出分组）。曾经这里用"宁多勿少"（空提示词就按全部卡片算），
+ *  结果是"上游什么都没有、拆分节点却报 2图 1音"，与后端口径对不上，已改掉。
+ *
+ *  ⚠️ 与编辑器用的 resolveMedia 有**一处故意不同**：resolveMedia 在提示词为空时不产生
+ *  filteredOut（那条琥珀提示条只在"后端真跑起来、确实丢了卡"时才该出现），
+ *  而本函数是给"口数"用的，必须按后端真实结果算 → 空提示词 = 0。
+ *
+ *  `known` 只表示**上游确实有卡片可数**（= 本次读数可作为权威依据）；
+ *  没有卡片时 known=false，调用方别拿 0 去覆盖用户的控件值。
+ *  `filtered` 说明数量是否已按提示词过滤（false = 提示词**读不到**，按全部卡片算）。
+ *  video 恒为 0：本包资产卡不带视频素材（后端 ref_videos 只能由别的来源塞）。
+ *
+ *  **上限口径**（2026-09-21 加）：返回的 image / audio 已经夹到 H3 上限内
+ *  （图 ≤ 9、音 ≤ 3），因为那才是后端真会产出的数量。原始条数放在 `imageRaw` / `audioRaw`
+ *  里，超出的部分放进 `imageOverflow` / `audioOverflow`（条数）——
+ *  两者的处理**故意不同**：音频超了后端是**截断**（保留前 3 条），图片超了后端**直接报错**。
+ *  所以 audioOverflow > 0 时界面要提示"只保留前 3 条"，imageOverflow > 0 时要提示"会跑不了"。 */
+export function resolveMediaCounts(node) {
+    const empty = {
+        image: 0, video: 0, audio: 0, known: false, filtered: false, cards: 0,
+        imageRaw: 0, audioRaw: 0, imageOverflow: 0, audioOverflow: 0,
+    };
+    try {
+        if (!node) return empty;
+        const cards = flattenCards(node);
+        if (!cards.length) return empty;
+        const promptText = promptTextOf(node);   // null = 读不到；"" = 空着
+        let image = 0;
+        let audio = 0;
+        for (const card of cards) {
+            const info = cardInfo(card);
+            // 后端口径：资产名非空、且没出现在提示词里 → 整张卡丢掉（图 + 音一起丢）。
+            // 没有资产名的卡（裸图 / 没写名字）后端不过滤，这里也不过滤。
+            if (promptText !== null && info.role && !String(promptText).includes(info.role)) continue;
+            // info.audio 已经扣掉了「卡片静音」与「本段不带音」两种情况（见 cardInfo）。
+            if (info.image) image += 1;
+            if (info.audio) audio += 1;
+        }
+        return {
+            image: Math.min(image, MAX_IMAGES),
+            video: 0,
+            audio: Math.min(audio, MAX_AUDIOS),
+            known: true,
+            filtered: promptText !== null,
+            cards: cards.length,
+            imageRaw: image,
+            audioRaw: audio,
+            imageOverflow: Math.max(0, image - MAX_IMAGES),
+            audioOverflow: Math.max(0, audio - MAX_AUDIOS),
+        };
+    } catch (error) {
+        warn(error);
+        return empty;
+    }
 }
 
 /* ================================================================
@@ -863,21 +995,47 @@ function renderFromWidget(node) {
     editor.scrollTop = keep;
 }
 
-/** 把「被后端规则丢掉的卡」亮出来：编辑框上方一条琥珀色提示，不静默。
- *  没有被丢的卡 → 提示条收起，和以前长得一模一样。 */
+/** 把「后端不会照你看到的那样收」的情况亮出来：编辑框上方一条琥珀色提示，不静默。
+ *
+ *  三类内容，按严重程度排在一条里（都没有 → 提示条收起，和以前长得一模一样）：
+ *    ① 资产名没写进提示词 → 整张卡被丢（后端规则）；
+ *    ② 音频超过 3 条 → 后端**截断**，第 4 条往后不生效；
+ *    ③ 图片超过 9 张 → 后端**直接报错**，必须减下来。
+ *
+ *  「某条音被主动关掉」（卡片静音 / 本段不带音）**不算问题**，是用户自己的选择，
+ *  不在这里报 —— 它在画布上由琥珀色连线圆点表示，右键那条连线随时能改回来。 */
 function updateFilterWarn(node) {
     const el = node?.__dnpFilterWarn;
     const media = node?.__dnpMedia;
     if (!el || !media) return;
+    const parts = [];
+
     const list = Array.isArray(media.filteredOut) ? media.filteredOut : [];
-    if (!list.length) {
+    if (list.length) {
+        const names = [...new Set(list.map((item) => item.role))].join("、");
+        parts.push(`${list.length} 张卡不计入编号 —— 提示词里没提到资产名：${names}。`
+            + "把资产名写进提示词就会回来，或者断开这条连线。");
+    }
+
+    const overflowAudios = Array.isArray(media.audioOverflow) ? media.audioOverflow.length : 0;
+    if (overflowAudios) {
+        const who = [...new Set(media.audioOverflow.map((item) => item.role || item.filename))].join("、");
+        parts.push(`参考音频超出 H3 上限（${MAX_AUDIOS} 条）—— 超出的 ${overflowAudios} 条（${who}）`
+            + `不会送进模型，后端只保留前 ${MAX_AUDIOS} 条。`
+            + "要给它们腾位置：右键那条连线的圆点选「本段不带音」，或用同一菜单把它们的序号提前。");
+    }
+
+    if (media.imageOverflow) {
+        parts.push(`参考图超过 H3 上限（${MAX_IMAGES} 张）—— 后端会直接报错跑不了，`
+            + `请减到 ${MAX_IMAGES} 张以内（断开多余的连线）。`);
+    }
+
+    if (!parts.length) {
         el.classList.remove("dnp-show");
         el.textContent = "";
         return;
     }
-    const names = [...new Set(list.map((item) => item.role))].join("、");
-    el.textContent = `${list.length} 张卡不计入编号 —— 提示词里没提到资产名：${names}。`
-        + "把资产名写进提示词就会回来，或者断开这条连线。";
+    el.textContent = parts.join(" ");
     el.classList.add("dnp-show");
 }
 
@@ -896,19 +1054,26 @@ export function refreshPromptMedia(node) {
     }
 }
 
-/** 「资产名没出现在提示词里、后端不会收这张卡」的**来源节点 id 集合**（Number）。
+/** 「后端不会收这张卡」的**来源节点 id 集合**（Number）—— 画布层据此压灰的判据。
  *
- *  给画布层用：连线与中点圆点据此压灰（dn_media_multilink / dn_upstream_highlight），
- *  与编辑器里的提示条、编号用的是**同一条规则**（见 resolveMedia），不会两边说得不一样。
- *  与 resolveMedia 同样保守：提示词为空 / 拿不到 → 空集合（不标灰）。 */
+ *  规则（与 getLinkBadges **必须逐字一致**，改一处就得改另一处）：
+ *    ① 资产名为空的卡**永远不算**（后端 `if role_name:` 为假 → 保留；裸图也不过滤）；
+ *    ② 提示词是**空字符串** → 所有带资产名的卡都算。后端此刻 `role_name not in ""` 恒真，
+ *       一张都不会收 —— 所以画布上就该是"一张都没引用"（灰虚线、不画编号），
+ *       而不是空空如也的提示词配着 3 条绿线 1/2/3；
+ *    ③ 提示词有内容 → 资产名不在文本里的卡；
+ *    ④ 提示词**读不到**（widget 缺失 / 被转成输入连线）→ 空集合：无法判断就别装能判断。 */
 export function getFilteredSourceIds(node) {
     try {
-        const promptText = promptTextOf(node);
         const ids = new Set();
-        if (!promptText) return ids;
+        if (!node) return ids;
+        const promptText = promptTextOf(node);
+        if (promptText === null) return ids;
+        const blank = promptText === "";
         for (const card of flattenCards(node)) {
             const info = cardInfo(card);
-            if (info.role && !promptText.includes(info.role)) ids.add(Number(info.node.id));
+            if (!info.role) continue;
+            if (blank || !promptText.includes(info.role)) ids.add(Number(info.node.id));
         }
         return ids;
     } catch (error) {
@@ -919,24 +1084,30 @@ export function getFilteredSourceIds(node) {
 
 /** 每条来源卡在**后端口径**下的显示信息：Map<来源节点 id, { off, label }>。
  *
- *  off   = 资产名没出现在提示词里，后端不会收这张卡
+ *  off   = 后端不会收这张卡（规则见 getFilteredSourceIds，两处必须一致）
  *  label = 后端实际会给的编号：带图 → <Picture N>；只带音 → <Audio J>；都没有 → ""
  *  编号按**过滤之后**的顺序数 —— 被丢的卡不吃号，后面的卡往前补，
  *  连线圆点显示的数字从此与后端一致（不再出现"虚线 2、实线 1 3、后端却是 1 2"的错位）。
  *  被丢的卡 label 为空串 → 圆点不画数字（灰点本来就在说"这张不算"）。
- *  与 resolveMedia / getFilteredSourceIds 同一条规则、同样保守（提示词拿不到 → 全部不标灰）。 */
+ *  audioOff = 这张卡**有音但这条音被关掉了**（卡片静音 or 本段不带音）→ 圆点换琥珀色，
+ *  与"被后端丢掉"（灰点）区分开：那张是故障，这张是你自己的选择。
+ *  音频编号到 H3 上限（3 条）就停 —— 超出的那条后端不会收，圆点上也不该有它的数字。 */
 export function getLinkBadges(node) {
     try {
         const map = new Map();
         if (!node) return map;
         const promptText = promptTextOf(node);
+        // 提示词是空字符串 → 一张都没引用（后端会把带资产名的卡全部丢掉，见 getFilteredSourceIds）。
+        // 以前这里写的是 `promptText && …`，空提示词直接短路成"全部已引用"，与实际相反。
+        const blank = promptText === "";
         const entries = flattenCards(node).map((card) => ({ card, info: cardInfo(card) }));
         let pic = 0;
         let aud = 0;
         for (const { card, info } of entries) {
             const id = Number(info.node.id);
             if (map.has(id)) continue;          // 同一张卡接了两条线：以第一条为准
-            const off = Boolean(promptText && info.role && !promptText.includes(info.role));
+            const off = Boolean(info.role)
+                && (blank || Boolean(promptText && !promptText.includes(info.role)));
             let label = "";
             let myPic = 0;
             let myAud = 0;
@@ -944,10 +1115,20 @@ export function getLinkBadges(node) {
                 // ⚠️ pic/aud 用的是**外层**计数器 —— 循环里再声明 let 会把计数器遮蔽成"每张卡都从 1 数"
                 //    且没图/没音的卡必须存 0，不能把计数器当前值带出去（会污染"编号→卡"反查表）
                 if (info.image) { pic += 1; myPic = pic; }
-                if (info.audio) { aud += 1; myAud = aud; }
+                // 音频到 H3 上限就停发（后端截断）→ 超出的不占编号，圆点上也不该有它的数字
+                if (info.audio && aud < MAX_AUDIOS) { aud += 1; myAud = aud; }
                 label = info.image ? String(pic) : (info.audio ? String(aud) : "");
             }
-            map.set(id, { off, label, pic: myPic, aud: myAud });
+            map.set(id, {
+                off,
+                label,
+                pic: myPic,
+                aud: myAud,
+                // 这条连线上的音被关掉了（卡片静音 or 本段不带音）→ 画布上换个颜色标出来
+                audioOff: Boolean(info.audioName) && !info.audio,
+                skipAudio: info.skipAudio,
+                muted: info.muted,
+            });
         }
         return map;
     } catch (error) {

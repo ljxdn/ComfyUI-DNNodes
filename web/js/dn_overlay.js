@@ -49,6 +49,11 @@ export const VIRTUAL_DOT = {
  *  序号**保留**——右键菜单的「序号提前 / 序号退后 / 删除」还靠它在定位。 */
 export const VIRTUAL_DOT_INACTIVE = { fill: "#7f8a86", ring: "#0d1210", text: "#101513" };
 
+/** 「这张卡有音，但这条音本段不送」的圆点配色：琥珀色。
+ *  与 VIRTUAL_DOT_INACTIVE 刻意区分 —— 灰点说"后端把这张卡丢了"（故障），
+ *  琥珀说"你要的就是这样"（卡片静音 / 本段不带音）。图仍然照常送，编号照常。 */
+export const VIRTUAL_DOT_NO_AUDIO = { fill: "#ef9f27", ring: "#3a2205", text: "#2b1803" };
+
 /** 在 (x, y) 画一个带序号的圆点。坐标 = 画布坐标。
  *  `style` 可选，传 { fill, ring, text } 的子集可整体换成灰色态（VIRTUAL_DOT_INACTIVE）。 */
 export function drawVirtualDot(ctx, x, y, label, style) {

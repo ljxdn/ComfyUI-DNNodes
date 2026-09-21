@@ -80,14 +80,14 @@ SOFTWARE.
 
 ---
 
-## 4. ComfyUI-MiniMaxH3-Easy —— 参考其编辑器做法（MIT，未复制代码）
+## 4. ComfyUI-MiniMaxH3-Easy —— 参考其编辑器与动态输出口做法（MIT，未复制代码）
 
 | 项 | 内容 |
 |---|---|
 | 作者 | [@nkxx188](https://github.com/nkxx188) |
 | 许可 | MIT License，`Copyright (c) 2026 nkxx188` |
-| 关系 | 本包 `web/js/dn_prompt_rich.js` 参考了其 `web/minimax_h3_easy_ui.js` 里「原生控件隐藏但仍参与序列化 + contenteditable 芯片编辑器」的做法 |
-| 是否复制代码 | **未复制**。 |
+| 关系 | ① 本包 `web/js/dn_prompt_rich.js` 参考了其 `web/minimax_h3_easy_ui.js` 里「原生控件隐藏但仍参与序列化 + contenteditable 芯片编辑器」的做法。<br>② 本包「资产卡Group拆分」（`web/js/dn_group_split.js` + `group_split_core.py`）的**动态输出口**做法参考其「媒体拆分」节点（`MiniMaxH3EasyMediaSplitter` + `web/minimax_h3_easy_ui.js`）：从节点定义里剔除素材口 → 按数量在前端重建 `addOutput`/`removeOutput` → 重排后修正连线的 `origin_slot`；「数量不足的口给空值让下游分支被剪掉」对齐其使用 `ExecutionBlocker` 的处理方式。 |
+| 是否复制代码 | **未复制**。本包为独立实现（自写的口位命名、重排与指纹保护逻辑），仅在机制与思路上参考。 |
 
 ---
 
