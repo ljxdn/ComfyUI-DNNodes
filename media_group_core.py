@@ -33,7 +33,7 @@ MAX_REFERENCE_AUDIOS = 3
 #: 段级音频开关（隐藏输入 ``link_audio_mask``）用的掩码字符。
 #: ``"1"``（或真空缺）= 保留这条连线的音频；``"0"`` = 本段不带音。
 #: 为什么需要段级：卡片自己的 ``audio_muted`` 是**卡级**属性 —— 同一张卡被多个
-#: 「资产卡 to Director Group」引用（= 多个段）时，一勾静音则**所有段**都失去音色参考，
+#: 「资产卡镜头打包」引用（= 多个段）时，一勾静音则**所有段**都失去音色参考，
 #: 而实际需求往往是「A 段要他的音色、B 段不要」。
 AUDIO_MASK_KEEP = "1"
 AUDIO_MASK_SKIP = "0"
@@ -67,7 +67,7 @@ def _wrap_bare_image(tensor: torch.Tensor) -> dict[str, Any]:
     """把裸 IMAGE 张量包成 IMAGE 型 media，规则对齐 H3MediaPrompt。"""
     if len(tensor.shape) != 4 or tensor.shape[-1] not in (1, 3, 4):
         raise TypeError(
-            "DN Media to Director Group: IMAGE 输入必须是 [B, H, W, C] 张量，"
+            "DN Asset Card Shot: IMAGE 输入必须是 [B, H, W, C] 张量，"
             f"且通道数为 1/3/4，实际为 {tuple(tensor.shape)}"
         )
     return {"type": "IMAGE", "image": tensor, "audio": None, "role_name": None, "prompt": None}
@@ -106,7 +106,7 @@ def flatten_medias(value: Any) -> list[dict[str, Any]]:
             bare_images.append(_wrap_bare_image(node))
             return
         raise TypeError(
-            "DN Media to Director Group: medias 只接受 H3_MEDIA 对象或 IMAGE 张量，"
+            "DN Asset Card Shot: medias 只接受 H3_MEDIA 对象或 IMAGE 张量，"
             f"实际收到 {type(node)!r}"
         )
 
@@ -357,7 +357,7 @@ def extract_reference_slots(
         if image is not None:
             if len(ref_images) >= MAX_REFERENCE_IMAGES:
                 raise ValueError(
-                    f"DN Media to Director Group: 参考图超过 {MAX_REFERENCE_IMAGES} 张上限"
+                    f"DN Asset Card Shot: 参考图超过 {MAX_REFERENCE_IMAGES} 张上限"
                     "（MiniMax H3 只支持 <Picture 1>…<Picture 9>）。"
                 )
             ref_images[len(ref_images)] = resize_long_edge(image[:1].clone(), max_edge)
@@ -418,11 +418,11 @@ def build_r2v_group(
     )
     ref_images, ref_audios = extract_reference_slots(kept, max_edge, notes)
     if notes:
-        print("[DN Media to Director Group] " + " ".join(notes))
+        print("[DN Asset Card Shot] " + " ".join(notes))
 
     if not prompt_text and not ref_images and not ref_audios:
         raise ValueError(
-            "DN Media to Director Group: 至少需要一段提示词，或一组参考图 / 参考音频。"
+            "DN Asset Card Shot: 至少需要一段提示词，或一组参考图 / 参考音频。"
         )
 
     return {

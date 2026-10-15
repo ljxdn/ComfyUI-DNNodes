@@ -3,7 +3,7 @@ import { addForegroundPainter, addHandleProvider, drawVirtualDot, PAINTER_TOP, V
 import { refreshPromptMedia, getLinkBadges, planCardSwap, applyCardSwap, isNoneName } from "./dn_prompt_rich.js";
 
 /*
- * 资产卡 to Director Group —— medias 单端口多连线。
+ * 资产卡镜头打包 —— medias 单端口多连线。
  *
  * 前端一个输入插槽只存一条 link（NodeInputSlot.link 是单值），第二条线会顶掉第一条。
  * 所以「一个端口接多张卡」必须自己做：虚拟连线存在节点属性里，执行时注入隐藏输入 media_1..9。
@@ -53,6 +53,9 @@ function isAudioSkipped(link) {
    两者比圆点本身大一圈，方便点。 */
 const DOT_HIT_RADIUS = 20;
 const HANDLE_SIZE = 40;
+/* 跨图粘贴后，"连线救不回来"如果只是因为卡的身份还没落地（控件未实例化 / properties 未写入），
+   这条连线要**挂起**等下一帧再试，而不是当场判死删掉（删了不可逆）。挂起的宽限期。 */
+const PENDING_GRACE_MS = 6000;
 
 /** 返回该节点的虚拟媒体连接记录（数组即顺序）。 */
 function getLinks(node) {
@@ -73,7 +76,11 @@ function readSource(graph, link) {
     const sourceNode = link.origin_node || link.originNode || link.fromNode || link.sourceNode || getNode(graph, sourceId);
     const sourceSlot = Number(link.origin_slot ?? link.originSlot ?? link.from_slot ?? link.fromSlot ?? 0);
     if (!sourceNode || !Number.isFinite(sourceSlot)) return null;
-    return { sourceNode, sourceId: Number(sourceNode.id), sourceSlot, sourceType: link.type || sourceNode.outputs?.[sourceSlot]?.type || "H3_MEDIA" };
+    // 顺带把来源卡（若为资产卡）的两把稳定键记下来 —— 跨画布复制后 source_id 会失效，
+    // 这两个字段是"不依赖旧图还开着"就能重映射的钥匙（图片指纹比资产名更早就绪）。
+    const sourceRole = assetNameOf(graph, Number(sourceNode.id)) || "";
+    const sourceImage = assetImageOf(graph, Number(sourceNode.id)) || "";
+    return { sourceNode, sourceId: Number(sourceNode.id), sourceSlot, sourceType: link.type || sourceNode.outputs?.[sourceSlot]?.type || "H3_MEDIA", sourceRole, sourceImage };
 }
 
 /** 返回可见 medias 输入及其索引。 */
@@ -97,21 +104,468 @@ function getMediaPosition(node) {
     }
 }
 
-/** 清理重复或来源节点已不存在的虚拟连接。 */
+/** 取一张资产卡（H3MediaLoader）的"资产名"—— 链路里唯一稳定的主键。
+ *  资产名存在 `role_name` 控件里（asset_card.js 的 roleNameOf 同款逻辑）。
+ *
+ *  ⚠️ 必须**多路回退**，因为节点刚被复制/粘贴进新图那一刻，`node.widgets` 实例
+ *  数组可能还是空的（控件要等渲染才重新实例化）—— 只读 widget 会拿到空串，
+ *  导致按资产名重映射失败、连线被静默丢弃（实测"复制后只断某一条"的根因）。
+ *  取值优先级：
+ *  ① 已实例化的 widget（`node.widgets` 里有 role_name）
+ *  ② `widgets_values_named.role_name`（序列化时按名字存的值，**不依赖 widget 实例**，
+ *     粘贴后立即可用 —— 这是最稳的一路）
+ *  ③ `properties.pml_role_name`
+ *  ④ `node.title` */
+function assetNameOf(graph, id) {
+    const node = graph?.getNodeById?.(id);
+    if (!node) return "";
+    const widget = (node.widgets || []).find((w) => w?.name === "role_name");
+    if (widget?.value != null && String(widget.value).trim()) return String(widget.value).trim();
+    const named = node?.widgets_values_named?.role_name;
+    if (named != null && String(named).trim()) return String(named).trim();
+    const propRole = node?.properties?.pml_role_name;
+    if (propRole != null && String(propRole).trim()) return String(propRole).trim();
+    return String(node?.title ?? "").trim();
+}
+
+/** 节点是否资产卡（H3MediaLoader）。
+ *  ⚠️ 三字段全兜：官方节点运行时带 `type`，自研节点带 `comfyClass`，
+ *  个别版本序列化后还残留 `_comfy_node_type`。只看其中一个会漏判（真机踩过）。 */
+function isMediaCard(node) {
+    if (!node) return false;
+    const t = node.comfyClass || node.type || node._comfy_node_type;
+    return t === "H3MediaLoader";
+}
+
+/** 节点是否是 LGraphGroup（框选组）。 */
+function isGraphGroup(node) {
+    if (!node) return false;
+    const t = node.comfyClass || node.type || node._comfy_node_type;
+    return t === "LGraphGroup";
+}
+
+/** 取一张资产卡的**身份指纹** = 图片文件名。与 `assetNameOf` 同源（都由同一张卡派生），
+ *  但它在**时间上更早可用**，是跨画布粘贴时真正靠得住的那把钥匙。
+ *
+ *  ⚠️ 为什么不能只靠资产名：粘贴那一刻资产名的两条来源**同时**不可用 ——
+ *    - `node.widgets` 实例：ComfyUI 1.53 的控件由 Vue 组件挂载时才创建，粘贴后要等若干帧；
+ *    - `widgets_values_named`：那是**保存工作流**时才写出的字段，Ctrl+C 的剪贴板
+ *      （`node.serialize()`）根本不带它。
+ *  于是"候选卡名读不出来"→ 按名匹配落空 → 连线被判失效丢弃（且不可逆）→ 整组线全断。
+ *
+ *  `properties.pml_image_filename` 没有这个时序问题：它在 `configure` 阶段就已写好
+ *  （早于控件实例化），且 properties 一定会随剪贴板 / 存盘一起走。
+ *  取值优先级（越靠前越早可用）：
+ *  ① `properties.pml_image_filename` —— configure 期即在，**首帧就能读到**
+ *  ② `widgets_values_named.image_filename`
+ *  ③ 已实例化的 `image_filename` 控件
+ *  ④ `widgets_values[0]`（该数组首项恒为图片名 —— 最后兜底） */
+function assetImageOf(graph, id) {
+    const node = graph?.getNodeById?.(id);
+    if (!node) return "";
+    const prop = node?.properties?.pml_image_filename;
+    if (prop != null && String(prop).trim()) return String(prop).trim();
+    const named = node?.widgets_values_named?.image_filename;
+    if (named != null && String(named).trim()) return String(named).trim();
+    const widget = (node.widgets || []).find((w) => w?.name === "image_filename");
+    if (widget?.value != null && String(widget.value).trim()) return String(widget.value).trim();
+    const values = node?.widgets_values;
+    if (Array.isArray(values) && values.length && String(values[0] ?? "").trim()) return String(values[0]).trim();
+    return "";
+}
+
+/** 卡的身份是否**还没就绪**（刚粘贴、控件与 properties 都还没落地的那几帧）。
+ *  用来判断"连线救不回来"到底是"这张图确实没这张卡"还是"再等一帧就能救" ——
+ *  后者必须保留连线，否则第一帧就把线删了，之后卡名可读了也回不来。
+ *
+ *  ⚠️⚠️ 判据必须是「**身份读得出来**」，绝不能是「role_name 控件存在」（2026-10-01 真机实测）。
+ *  跨流粘贴后的第一帧：节点已经建好、`widgets` 数组里 `role_name` 控件也**已经存在**，
+ *  但控件值是空的、`properties.pml_image_filename` 也还没写。旧判据看到"有控件"就判定
+ *  "身份已就绪" → `grace = 0` → 悬空连线**当帧被删**（不可逆），而 `remapBrokenLink`
+ *  在那一帧同样读不出身份、救不回来 → 复制到别的流后连线**全断**。
+ *  真机诊断实录：`normalize node=5109 raw=3 kept=0 dropped=3`，且 removed 前后都没有 remap。 */
+function identityPending(node) {
+    if (!isMediaCard(node)) return false;
+    const graph = node.graph || app.graph;
+    // ① 图片指纹可读 → 真就绪（`properties.pml_image_filename` 在 configure 期就在）
+    if (assetImageOf(graph, node.id)) return false;
+    // ② 资产名有**实际值**（不是"控件在但值是空的"）→ 真就绪
+    if (node?.properties?.pml_role_name) return false;
+    if (node?.widgets_values_named?.role_name) return false;
+    const widget = (node.widgets || []).find((w) => w?.name === "role_name");
+    if (widget && String(widget.value ?? "").trim()) return false;
+    return true;   // 三路都读不出 → 还没就绪，必须宽限
+}
+
+/* 最近一次「复制」时选中的资产卡：原 id → { name, image }。
+ * 粘贴后连线记录里的 source_id 就是这里的**原 id**，所以拿它可以不依赖任何既有烙印地重映射。
+ * ⚠️ 每次复制都**整体重置**（哪怕这次一张卡都没选）—— 否则上一次的旧指纹会被误用到
+ * 下一次无关的粘贴上，把线接到错的卡。 */
+let COPY_KEYS = null;
+
+/* ===================== DIAG-BEGIN 真机诊断（临时，定位后整块删除）=====================
+ * 把「复制 / 粘贴 / 丢线」的全过程落到磁盘，供离线分析 —— 不用用户开控制台。
+ * 写到 ComfyUI 的 userdata：POST /userdata/dn_diag.json
+ * 实际落盘：<comfy>/user/default/dn_diag.json */
+const DN_DIAG = { startedAt: Date.now(), ua: navigator?.userAgent || "", events: [] };
+let DN_DIAG_TIMER = null;
+/** 真机取证开关 —— **默认关闭，零开销**。
+ *  要抓"复制/粘贴丢线"这类跨画布时序问题时，在地址栏加 `?dn_diag=1` 刷新
+ *  （或 `localStorage.dn_diag = "1"` 后刷新），事件会写进
+ *  `<comfy>/user/default/dn_diag.json`，不用开控制台。*/
+const DN_DIAG_ON = (() => {
+    try {
+        return new URLSearchParams(location.search).has("dn_diag")
+            || localStorage.getItem("dn_diag") === "1";
+    } catch (error) { return false; }
+})();
+function dnBrief(node) {
+    if (!node) return null;
+    return {
+        id: node.id,
+        type: node.type,
+        comfyClass: node.comfyClass,
+        title: node.title,
+        role: node?.properties?.pml_role_name || node?.widgets_values_named?.role_name || "",
+        image: node?.properties?.pml_image_filename || "",
+        nWidgets: (node.widgets || []).length,
+    };
+}
+function dnBriefLinks(node) {
+    try { return getLinks(node).map((l) => ({ ...l })); } catch (error) { return []; }
+}
+function dnFlushDiag() {
+    if (DN_DIAG_TIMER) return;
+    DN_DIAG_TIMER = setTimeout(() => {
+        DN_DIAG_TIMER = null;
+        try {
+            fetch("/userdata/dn_diag.json", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(DN_DIAG, null, 2),
+            }).catch(() => { /* 静默 */ });
+        } catch (error) { /* 静默 */ }
+    }, 500);
+}
+function dnDiag(tag, extra) {
+    if (!DN_DIAG_ON) return;
+    try {
+        const ev = { seq: DN_DIAG.events.length, ms: Date.now() - DN_DIAG.startedAt, tag };
+        if (extra) for (const k of Object.keys(extra)) ev[k] = extra[k];
+        DN_DIAG.events.push(ev);
+        if (DN_DIAG.events.length > 300) DN_DIAG.events.splice(0, 150);
+        dnFlushDiag();
+    } catch (error) { /* 静默 */ }
+}
+/* ===================== DIAG-END ===================== */
+
+/** 复制动作发生时（Ctrl+C / 右键 Copy / 菜单），把选中资产卡的身份抄一份下来。
+ *  这一刻源图的卡一定是活的（用户正看着它、选中它），读它的属性最可靠。
+ *
+ *  读取顺序（覆盖各种选中形态）：
+ *  ① `canvas.selectedItems` —— 1.53 里真正确定剪贴板内容的字段（`useCopy` →
+ *     `canvas.copyToClipboard()` → `_serializeItems(selectedItems)` 就靠它）。
+ *     这里面可能有两种"可选中"类型：
+ *     - LGraphNode：直接当卡用；
+ *     - LGraphGroup：**这就是你描述"先选资产卡 group 就丢"的坑** —— 框选的 group 在
+ *       selectedItems 里只出现 group 本身，不会展开里面的卡。必须把它 group 的
+ *       `_children`（框内所有子节点/子 group）递归展开，找到其中的 H3MediaLoader。
+ *  ② 兜底 `canvas.selected_nodes` —— 1.53 里已 `@deprecated`，但老版本仍在用；
+ *     同样要遍历其 values。
+ *  只要一张卡命中就整体记录，避免下次粘贴时 COPY_KEYS 为空把线全断掉。 */
+function captureCopyKeys(canvas) {
+    const graph = canvas?.graph || app.graph;
+    dnDiag("copy:in", {   /* DIAG */
+        isAppCanvas: canvas === app.canvas,
+        hookFlag: !!canvas?.__DnCopyKeysHooked,
+        nSelectedItems: canvas?.selectedItems?.size ?? -1,
+        selectedItems: DN_DIAG_ON ? (canvas?.selectedItems ? Array.from(canvas.selectedItems) : []).map(dnBrief) : [],
+        selectedNodes: DN_DIAG_ON ? Object.values(canvas?.selected_nodes || {}).map(dnBrief) : [],
+        graphNodes: DN_DIAG_ON ? (graph?._nodes || []).map(dnBrief) : [],
+    });
+    const map = {};
+    const collectFromNode = (node) => {
+        if (!isMediaCard(node)) return;
+        const id = Number(node?.id);
+        if (!Number.isFinite(id) || map[id]) return;
+        map[id] = { name: assetNameOf(graph, id) || "", image: assetImageOf(graph, id) || "" };
+    };
+    /** 从 group 里挖出所有资产卡（含嵌套 group）。group 存子节点的字段按
+     *  新→旧顺序探测，全拿不到再退回「按包围盒扫全图」这个**最稳**的路径。 */
+    const sweepGroupByBounds = (group) => {
+        // 包围盒 = [left, top, width, height]
+        const pos = group?.pos ?? group?._pos;
+        const size = group?.size ?? group?._size;
+        if (!pos || !size || !Array.isArray(pos) || !Array.isArray(size)) return;
+        const left = pos[0], top = pos[1], w = size[0], h = size[1];
+        if (!Number.isFinite(left) || !Number.isFinite(top) || w <= 0 || h <= 0) return;
+        for (const node of (graph?._nodes || [])) {
+            if (!isMediaCard(node)) continue;
+            const p = node.pos;
+            if (!p || !Array.isArray(p) || p.length < 2) continue;
+            // 卡中心点在包围盒内 → 视为组内（比逐字段存 children 可靠得多）
+            const cx = p[0] + (node.size?.[0] / 2 || 0);
+            const cy = p[1] + (node.size?.[1] / 2 || 0);
+            if (cx >= left && cx <= left + w && cy >= top && cy <= top + h) collectFromNode(node);
+        }
+    };
+    const walkGroupChildren = (group) => {
+        // ① 新版字段 `_children`（Set<Positionable>，1.53 实际使用的集合）
+        // ② 旧版 `_nodes`（LGraphNode[]，@deprecated 但仍可能残留）
+        // ③ 都没有（或里面拿不到资产卡）→ 包围盒扫全图兜底
+        const children = group?._children || group?._nodes;
+        let found = 0;
+        const scan = (item) => {
+            if (isGraphGroup(item)) { walkGroupChildren(item); found++; }
+            else if (isMediaCard(item)) { collectFromNode(item); found++; }
+        };
+        if (children instanceof Set) for (const item of children) scan(item);
+        else if (Array.isArray(children)) for (const item of children) scan(item);
+        if (!found) sweepGroupByBounds(group);
+    };
+    // ① selectedItems（1.53 真用的字段）
+    if (canvas?.selectedItems) {
+        for (const item of canvas.selectedItems) {
+            if (isGraphGroup(item)) walkGroupChildren(item);
+            else collectFromNode(item);
+        }
+    }
+    // ② 兜底 selected_nodes
+    for (const node of Object.values(canvas?.selected_nodes || {})) {
+        if (isGraphGroup(node)) walkGroupChildren(node);
+        else collectFromNode(node);
+    }
+    // ③ "只选中 资产卡镜头打包 节点"（B 场景，2026-10-01 用户实报）：
+    //    selectedItems 里只有一个 DNMediaToDirectorGroup 节点，资产卡一张都没选中。
+    //    此时从**该组节点自己连出的连线记录**里取 source_id，把这些卡一并记进指纹 ——
+    //    这些卡的 id 与连线里的 source_id 一一对应，重映射时正好用得上。
+    //    （资产卡本身不随剪贴板走，记指纹是**为组节点自己的连线重映射备钥匙**。）
+    const isDNGroup = (n) => n?.comfyClass === NODE_CLASS || n?.type === NODE_CLASS;
+    if (canvas?.selectedItems) {
+        for (const item of canvas.selectedItems) {
+            if (!isDNGroup(item)) continue;
+            for (const link of getLinks(item)) collectFromNode(graph?.getNodeById?.(Number(link?.source_id)));
+        }
+    }
+    for (const item of Object.values(canvas?.selected_nodes || {})) {
+        if (!isDNGroup(item)) continue;
+        for (const link of getLinks(item)) collectFromNode(graph?.getNodeById?.(Number(link?.source_id)));
+    }
+    COPY_KEYS = Object.keys(map).length ? map : null;
+    // 🔧 焊钥匙：把指纹**直接写进源图连线自己的 properties**。
+    //    剪贴板（`node.serialize()`）只带 properties，**不带本模块的内存变量** ——
+    //    只记 COPY_KEYS 等于把钥匙留在源图的浏览器里；一旦粘贴后钩子没有重跑
+    //    （换了 canvas 实例 / 用户换了工作流 tab），新流的节点身上一把钥匙都没有，
+    //    线就只能被判失效丢弃。写到 link 上则随剪贴板一起过河，永不丢。
+    //    范围 = 本图所有 DN 组节点（不限被选中的那个）：只要某条 link 的 source_id
+    //    命中了本次抄下来的指纹表，就把它焊上去（map 由「选中的卡」+「选中组连出的卡」
+    //    组成，没命中的 link 不碰，不会焊错）。
+    for (const node of (graph?._nodes || [])) {
+        if (!isDNGroup(node)) continue;
+        for (const link of getLinks(node)) {
+            const clip = map[Number(link?.source_id)];
+            if (!clip) continue;
+            if (!link.source_role && clip.name) link.source_role = clip.name;
+            if (!link.source_image && clip.image) link.source_image = clip.image;
+        }
+    }
+    dnDiag("copy:out", { copyKeys: COPY_KEYS });   /* DIAG */
+    // 记录到 0 张卡时打一条（正常复制有卡时静默）。方便真机定位"复制那一刻选中集合里到底有什么"。
+    if (!COPY_KEYS && (canvas?.selectedItems?.size || Object.keys(canvas?.selected_nodes || {}).length)) {
+        const selTypes = (canvas?.selectedItems ? Array.from(canvas.selectedItems) : []).map((x) => x?.type || x?.comfyClass).join(",");
+        console.warn("[DN multilink] 复制时选中集合里没有可识别的资产卡/H3MediaLoader，COPY_KEYS 为空。selectedItems 类型:", selTypes || "(无)");
+    }
+}
+
+/** 按资产名重映射：当 source_id 在当前图里查不到节点（节点被复制进新画布、
+ *  id 被重新分配）时，用**资产卡资产名（role_name）**当主键，在本图里找到同名同类型
+ *  的 H3MediaLoader，把 source_id 改指过去。
+ *
+ *  为什么能这样做：
+ *  - 整条链路（prompt 过滤 / 上色 / 参考音频绑定）本来就全靠**资产名**当主键，
+ *    一张资产卡的"身份"在图里就是它的资产名；复制进新流后资产名不变、节点 id 变。
+ *  - 这是官方组节点（graphToGroup）做 id 重映射的同一思路：关系不靠裸 id 指针，
+ *    靠一个**稳定键**（这里 = 资产名）在重建后重新绑定。
+ *  - 找不到同名节点才放弃（返回 false），由 normalizeLinks 照常丢弃，不误连。
+ *  - 同名有两张卡（新流里故意放了重名）不动，留给人处理 —— 避免把线连到错的卡。
+ *
+ *  资产名来源（按可靠性排序，第一个拿到的就用）：
+ *  ① 连线自带的 `source_role` 字段（新版连线创建时写入）—— 最稳，不依赖旧图还在；
+ *  ② 旧图（app.graph）里按旧 id 反查；
+ *  ③ 本图里按旧 id 反查（正常加载时旧 id 仍有效）。
+ *
+ *  返回是否改了这条连线。`remapLog`（可选）收集 "旧id → 新id" 记录，供调用方写回/日志。
+ *
+ *  ⚠️ **不要**用「`graph.getNodeById(oldId)` 存在」当"连线还活着"的判据 —— 两流同开时，
+ *  粘贴进来这组的 source_id（如 170）会撞上**当前流里另一张无关的 id=170 节点**，
+ *  一查命中就 `return false` 不重映射 → 连线接到**错的那张卡**上。
+ *  真正的"还活着"判据 = **source_id 指向的节点资产名 == 这条连线记录的 source_role**；
+ *  对不上（含撞 id）就按资产名找本图里的**正确**那张，找不到才丢弃。 */
+/** 用「资产名 / 图片指纹」在**本图**里找那张资产卡。找到**唯一**一张才返回它；
+ *  找不到、或有歧义（多张同名/同图）返回 null —— 宁可不连，也不连到错的卡上。
+ *
+ *  先按资产名找：重名（本图故意放了两张同名卡）时**不立刻放弃**，
+ *  再拿图片指纹区分 —— 两张卡重名但图片不同时仍能唯一定位到正确那张。 */
+function findCardByKeys(graph, name, image) {
+    const cards = (graph?._nodes || []).filter(isMediaCard);
+    if (name) {
+        const byName = cards.filter((n) => assetNameOf(graph, n.id) === name);
+        if (byName.length === 1) return byName[0];
+        if (byName.length > 1 && image) {
+            const narrowed = byName.filter((n) => assetImageOf(graph, n.id) === image);
+            if (narrowed.length === 1) return narrowed[0];
+        }
+        if (byName.length > 1) return null;   // 重名且指纹也分不开 → 留给人处理
+    }
+    if (image) {
+        const byImage = cards.filter((n) => assetImageOf(graph, n.id) === image);
+        if (byImage.length === 1) return byImage[0];
+    }
+    return null;
+}
+
+function remapBrokenLink(graph, link, remapLog) {
+    if (!link || !Number.isFinite(Number(link.source_slot))) return false;
+    const oldId = Number(link?.source_id);
+    const cur = Number.isFinite(oldId) ? (graph?.getNodeById?.(oldId) || null) : null;
+    const isCard = isMediaCard(cur);
+    // 连线记录里的两把稳定键（新版有；老连线没有 → 依次在"当前图 / 旧图 / 复制时记下的指纹"里反查）。
+    // 第三路（clip）是关键兜底：老工作流的连线里可能一把钥匙都没有，但用户**复制那一刻**
+    // 源图的卡是活的，从它身上现取的指纹足以把线在目标流里接回来。
+    const clip = COPY_KEYS?.[oldId] || null;
+    // 第三把钥匙（2026-10-01 补）：连线自己烙印在 properties 里的 `source_role` /
+    // `source_image`（每次渲染都会固化写入，随剪贴板一起走）—— 它是**跨画布**的键，
+    // 不依赖旧图还开着、也不依赖本次复制时选中了谁。只有它拿不到时才退回
+    // "当前图 / 旧图按 source_id 反查"（source_id 在别的流里指向的是别的节点，反查不可靠）。
+    const stampName = String(link?.source_role || "").trim();
+    const stampImage = String(link?.source_image || "").trim();
+    const recordName = stampName
+        || (isCard ? assetNameOf(graph, oldId) : assetNameOf(app.graph, oldId))
+        || clip?.name || "";
+    const recordImage = stampImage
+        || (isCard ? assetImageOf(graph, oldId) : assetImageOf(app.graph, oldId))
+        || clip?.image || "";
+    // "还活着"真实判据：source_id 指向的是资产卡，且**身份对得上**（资产名或图片指纹任一命中）。
+    // 撞 id（指向了当前流里另一张无关卡）→ 都对不上 → 不判活 → 触发重映射。
+    if (isCard && ((recordName && assetNameOf(graph, oldId) === recordName)
+        || (recordImage && assetImageOf(graph, oldId) === recordImage))) return false;
+    if (!recordName && !recordImage) return false;   // 两把钥匙都拿不到 → 交给 normalizeLinks 丢弃
+    const target = findCardByKeys(graph, recordName, recordImage);
+    if (!target) return false;                        // 本图没这张卡 / 有歧义 → 不误连
+    if (Number(target.id) === oldId) return false;    // 已经指向正确那张（老工作流 id 未变）
+    link.source_id = Number(target.id);
+    link.source_type = target.outputs?.[Number(link.source_slot)]?.type || link.source_type || "H3_MEDIA";
+    link.source_role = recordName || assetNameOf(graph, target.id);
+    link.source_image = recordImage || assetImageOf(graph, target.id);
+    if (remapLog) remapLog.push({ from: oldId, to: Number(target.id), name: link.source_role, image: link.source_image });
+    return true;
+}
+
+/** 清理重复或来源节点已不存在的虚拟连接。
+ *  失效连线（source_id 指向当前图里不存在的节点）在这里**先按资产名救回**，
+ *  救不回的再丢弃。本函数每帧（onDrawForeground）与加载时（onConfigure）都会跑，
+ *  是跨画布复制后 source_id 失效的自动重映射入口 —— 不依赖 onAddedToGraph（部分 LiteGraph
+ *  版本原型上不存在该钩子），也无需等到"节点真正进图"的时机。 */
 function normalizeLinks(node) {
     const graph = node?.graph || app.graph;
+    // ① 先救：把 source_id 失效的连线按资产名（连线自带的 source_role 或旧图反查）重映射到本图同名卡。
+    const links = getLinks(node);
+    const diagRaw = DN_DIAG_ON ? links.map((l) => ({ ...l })) : [];   /* DIAG */
+    const remapLog = [];
+    for (const link of links) remapBrokenLink(graph, link, remapLog);
+    if (remapLog.length) {
+        node.__dnRemappedLinks = remapLog;
+        dnDiag("remap", { nodeId: node.id, remapLog, from: diagRaw });   /* DIAG */
+        console.info(`[DN multilink] 节点 ${node.id}：source_id 失效，按资产名重映射 ${remapLog.length} 条连线`, remapLog);
+    }
+    // ② 固化：对 source_id 仍指向**活的资产卡**、且连线已记录资产名（或反查得出）的连线，
+    //    把 source_role 固化进 properties（老工作流没有这个字段，第一次渲染后永久自带键）。
+    //    安全阀：若 source_id 撞上了"资产名与连线记录不符"的节点（撞 id），**不固化错名**，
+    //    保持 source_role 原值，让 ① 重映射继续救 —— 否则会把"路人甲"写死成正确键。
+    for (const link of links) {
+        const sid = Number(link?.source_id);
+        if (!Number.isFinite(sid)) continue;
+        const cur = graph?.getNodeById?.(sid);
+        if (!isMediaCard(cur)) continue;
+        const name = assetNameOf(graph, sid);
+        const image = assetImageOf(graph, sid);
+        // 连线若已有 source_role 且与当前节点资产名不符 → 撞 id，不覆盖（保留原键给重映射）。
+        if (link.source_role && name && link.source_role !== name) continue;
+        if (name) link.source_role = name;
+        // 图片指纹一并烙印：它比资产名**更早可用**（configure 期即在），
+        // 复制到别的流后即使控件还没实例化，也能靠它把线接回正确的卡。
+        if (image) link.source_image = image;
+    }
+    // ②b 补键：连线**既无 source_role 又无 source_image**（老工作流存的）时，
+    //    本次复制若带了剪贴板指纹（COPY_KEYS），把键补进连线 —— 下次再复制就不需要指纹了。
+    for (const link of links) {
+        if (link.source_role || link.source_image) continue;
+        const clip = COPY_KEYS?.[Number(link?.source_id)];
+        if (!clip) continue;
+        if (clip.name) link.source_role = clip.name;
+        if (clip.image) link.source_image = clip.image;
+    }
+    // ③ 再丢：重映射/固化后仍指向**当前图里不存在节点**的（新图确实没这张同名卡）才丢弃。
+    // ⚠️ 必须用上面同一个 `graph` 查 —— 不能退回 app.graph：当前流粘贴时，
+    // source_id 已重映射到本图节点，若 app.graph 是另一张图，按 app.graph 查会误判"不存在"而丢线。
     const seen = new Set();
-    const valid = getLinks(node).filter((link) => {
+    // 刚粘贴进来的头几帧，卡的身份可能还没落地（控件没建、properties 也还没写）。
+    // 此时"查不到 source 节点"**不等于**"本图没有这张卡" —— 当场删掉就再也回不来，
+    // 所以先挂起（带超时），等下一帧身份可读了由 ① 救回。
+    const hasDangling = links.some((link) => {
+        const sid = Number(link?.source_id);
+        return Number.isFinite(sid) && graph?.getNodeById && !graph.getNodeById(sid);
+    });
+    const pending = (node.__dnPendingLinks ||= {});
+    const now = Date.now();
+    // 宽限窗口：两条独立来源，任一成立就给满额时间。
+    //  ① 图里还有卡的身份读不出来（控件值空 / properties 未写）= 粘贴后的典型首帧；
+    //  ② **本节点刚 Configure 完**（跨流粘贴 / 打开工作流）—— 无条件给窗口，
+    //     因为"这一帧读不出身份"≠"这张图没有这张卡"，而删掉是**不可逆**的。
+    const recentlyConfigured = Number.isFinite(node.__dnConfiguredAt)
+        && (now - node.__dnConfiguredAt) < PENDING_GRACE_MS;
+    const grace = hasDangling
+        && ((graph?._nodes || []).some(identityPending) || recentlyConfigured)
+        ? PENDING_GRACE_MS : 0;
+    const valid = links.filter((link) => {
         const sourceId = Number(link?.source_id);
         const sourceSlot = Number(link?.source_slot);
         const key = `${sourceId}:${sourceSlot}`;
         if (!Number.isFinite(sourceId) || !Number.isFinite(sourceSlot) || seen.has(key)) return false;
-        if (graph?.getNodeById && !getNode(graph, sourceId)) return false;
+        if (graph?.getNodeById && !graph.getNodeById(sourceId)) {
+            const deadline = pending[key] ?? (grace ? now + grace : 0);
+            if (deadline > now) {
+                pending[key] = deadline;
+                seen.add(key);
+                return true;   // 挂起：连线先留着，下一帧再试
+            }
+            delete pending[key];
+            return false;
+        }
+        delete pending[key];
         seen.add(key);
         return true;
     });
     valid.forEach((link, index) => { link.order = index + 1; });
     node.properties[LINKS_PROPERTY] = valid.slice(0, MAX_MEDIA);
+    /* DIAG：只在最终结果变化时上报一次，避免每帧刷屏（默认关闭时整块不执行） */
+    if (DN_DIAG_ON) try {
+        const sig = JSON.stringify([links.length, valid.length, links.map((l) => `${l.source_id}:${l.source_slot}`), valid.map((l) => `${l.source_id}:${l.source_slot}`)]);
+        if (node.__dnDiagSig !== sig) {
+            node.__dnDiagSig = sig;
+            dnDiag("normalize", {
+                nodeId: node.id,
+                graphIsApp: graph === app.graph,
+                graphLinkCount: graph?.links?.size ?? (graph?._links ? Object.keys(graph._links).length : -1),
+                rawLinks: diagRaw,
+                kept: valid.map((l) => ({ ...l })),
+                dropped: diagRaw.filter((r) => !valid.some((v) => Number(v.source_id) === Number(r.source_id) && Number(v.source_slot) === Number(r.source_slot))),
+                copyKeys: COPY_KEYS,
+                graphNodes: (graph?._nodes || []).map(dnBrief),
+                pendingCards: (graph?._nodes || []).filter(identityPending).map(dnBrief),
+            });
+        }
+    } catch (error) { /* 静默 */ }
     return node.properties[LINKS_PROPERTY];
 }
 
@@ -128,6 +582,8 @@ function syncNative(node) {
         source_id: source.sourceId,
         source_slot: source.sourceSlot,
         source_type: source.sourceType,
+        source_role: source.sourceRole,
+        source_image: source.sourceImage,
     };
 }
 
@@ -170,12 +626,12 @@ function convertVisibleConnection(node, linkInfo) {
     const pending = [];
     const stash = node.__dnNativeMedias;
     if (stash && !seen.has(`${stash.source_id}:${stash.source_slot}`)) {
-        pending.push({ source_id: stash.source_id, source_slot: stash.source_slot, source_type: stash.source_type, order: 0 });
+        pending.push({ source_id: stash.source_id, source_slot: stash.source_slot, source_type: stash.source_type, source_role: stash.source_role || assetNameOf(graph, stash.source_id), source_image: stash.source_image || assetImageOf(graph, stash.source_id), order: 0 });
         seen.add(`${stash.source_id}:${stash.source_slot}`);
     }
     const incoming = `${source.sourceId}:${source.sourceSlot}`;
     if (!seen.has(incoming)) {
-        pending.push({ source_id: source.sourceId, source_slot: source.sourceSlot, source_type: source.sourceType, order: 0 });
+        pending.push({ source_id: source.sourceId, source_slot: source.sourceSlot, source_type: source.sourceType, source_role: source.sourceRole || assetNameOf(graph, source.sourceId), source_image: source.sourceImage || assetImageOf(graph, source.sourceId), order: 0 });
     }
 
     node.__dnConverted = true;
@@ -498,67 +954,206 @@ function isConnectingMedia(canvas) {
     return String(slot?.name || "") === MEDIA_INPUT;
 }
 
+/**
+ * 把「画虚拟连线」挂到画布上。**三条钩子各自独立判定 —— 任何一条缺了都不影响其它两条。**
+ *
+ * 血泪史（2026-10-14 13:55 首次发现、2026-10-15 用户再次追问"这块的连线怎么又不显示"）：
+ *   以前这四条（drawConnections 补丁 / onDrawForeground 补丁 / DOM 覆盖层绘制 / 可点把手）
+ *   共用**同一个 guard** —— `typeof canvas.drawConnections === "function"`。后果：只要
+ *   那一个方法一时不在（前端换代、`app.canvas` 还没就绪、或**画布实例后来被整个换掉**），
+ *   四条**一起静默跳过** —— 线一条都不画、圆点也点不到，而且控制台一声不响。
+ *   现在改成：
+ *     · drawConnections 在 → 挂它（它在图变换**里头**被调用，坐标天然正确，首选）；
+ *     · 它不在、但 drawBackCanvas 在 → 挂 drawBackCanvas（1.53.x 的 drawFrontCanvas
+ *       必定走它）；代价是要自己补一次 `ds.toCanvasContext()` —— 因为它内部
+ *       `save/restore` 是成对的，返回时图变换已经被还原了；
+ *     · onDrawForeground 在 → 挂它（选中时再画一份到节点层之上，见文件头说明）。
+ *   真的一条都挂不上才放弃，并且打一条 console.warn（绝不静默）。
+ */
+function installDrawHooks(canvas) {
+    if (!canvas) return [];
+    const installed = [];
+    if (!canvas.__DnMultiLinkPatched && typeof canvas.drawConnections === "function") {
+        canvas.__DnMultiLinkPatched = true;
+        const originalDraw = canvas.drawConnections;
+        canvas.drawConnections = function (ctx) {
+            const result = originalDraw.apply(this, arguments);
+            drawVirtualLinks(this, ctx || this.bgctx || this.ctx);
+            return result;
+        };
+        installed.push("drawConnections");
+    }
+    if (!canvas.__DnMultiLinkPatched && !canvas.__DnBackPatched
+        && typeof canvas.drawBackCanvas === "function") {
+        canvas.__DnBackPatched = true;
+        const originalBack = canvas.drawBackCanvas;
+        canvas.drawBackCanvas = function () {
+            const result = originalBack.apply(this, arguments);
+            try {
+                const ctx = this.bgctx || this.ctx;
+                if (ctx) {
+                    // 见函数头：drawBackCanvas 内部 save/restore 成对，返回时变换已还原，
+                    // 必须重新套一遍图变换，否则线会画到画布坐标系之外（看着像"没画"）。
+                    ctx.save();
+                    this.ds?.toCanvasContext?.(ctx);
+                    drawVirtualLinks(this, ctx);
+                    ctx.restore();
+                }
+            } catch (error) {
+                console.warn("[DN multilink] drawBackCanvas 补绘失败:", error);
+            }
+            return result;
+        };
+        installed.push("drawBackCanvas");
+    }
+    if (!canvas.__DnForegroundPatched) {
+        canvas.__DnForegroundPatched = true;
+        const originalForeground = canvas.onDrawForeground;
+        canvas.onDrawForeground = function (ctx) {
+            const result = originalForeground?.apply(this, arguments);
+            try {
+                drawVirtualLinks(this, ctx || this.bgctx || this.ctx, { selectedOnly: true });
+            } catch (error) {
+                console.warn("[DN multilink] overlay draw failed:", error);
+            }
+            return result;
+        };
+        installed.push("onDrawForeground");
+    }
+    if (installed.length) {
+        console.info(`[DN multilink] 画布绘制钩子已装：${installed.join(" + ")}`);
+    }
+    if (!canvas.__DnMultiLinkPatched && !canvas.__DnBackPatched && !canvas.__DnDrawWarned) {
+        canvas.__DnDrawWarned = true;
+        console.warn("[DN multilink] 画布上找不到 drawConnections / drawBackCanvas"
+            + " —— 虚拟连线补绘挂不上（看门狗会每秒重试）");
+    }
+    return installed;
+}
+
+/**
+ * 看门狗：前端可能把整个画布实例换掉（Vue 重挂 / 切工作流 / 节点上刚挂 DOM 控件那一下），
+ * 新画布上一个标记都没有，而 `installPatches` 的 12×250ms 早就放弃了 ——
+ * 于是"线不显示"而且**永远不会自己好**。
+ * 这里每秒比一次对象引用：没换就只是一次 `===`，开销可忽略；换了就把补丁重挂一遍
+ * （`patchCanvas` 内部每条钩子都自带 guard，幂等，不会越套越深）。
+ */
+function startCanvasWatchdog() {
+    if (extension.__dnWatchdog) return;
+    extension.__dnWatchdog = true;
+    let last = null;
+    setInterval(() => {
+        let canvas = null;
+        try { canvas = app?.canvas; } catch (error) { return; }
+        if (!canvas) return;
+        const ready = canvas.__DnForegroundPatched
+            && (canvas.__DnMultiLinkPatched || canvas.__DnBackPatched)
+            && canvas.__DnMousePatched
+            && canvas.__DnPointerPatched;
+        if (canvas === last && ready) return;
+        last = canvas;
+        try {
+            patchCanvas();
+        } catch (error) {
+            console.warn("[DN multilink] 看门狗补装失败:", error);
+        }
+    }, 1000);
+}
+
 /** 覆盖画布连接层，补绘虚拟连接并恢复其菜单交互。 */
 function patchCanvas() {
-    const canvas = app.canvas;
-    if (!canvas || canvas.__DnMultiLinkPatched || typeof canvas.drawConnections !== "function") return;
-    canvas.__DnMultiLinkPatched = true;
-    const originalDraw = canvas.drawConnections;
-    canvas.drawConnections = function (ctx) {
-        const result = originalDraw.apply(this, arguments);
-        drawVirtualLinks(this, ctx || this.bgctx || this.ctx);
-        return result;
-    };
-    // 选中 DN 节点时，把这些虚拟连线**再画一遍到节点层之上**：
-    // 连接层在节点之下，线中点会被别的节点压住 → 右键菜单点不到（实际遇到的问题）。
-    const originalForeground = canvas.onDrawForeground;
-    canvas.onDrawForeground = function (ctx) {
-        const result = originalForeground?.apply(this, arguments);
-        try {
-            drawVirtualLinks(this, ctx || this.bgctx || this.ctx, { selectedOnly: true });
-        } catch (error) {
-            console.warn("[DN multilink] overlay draw failed:", error);
-        }
-        return result;
-    };
-    // 但「节点层之上」对**自绘 UI 的节点**还不够：那些节点的内容是真 DOM 元素，
-    // canvas 上画的线永远压在它们下面（实测资产卡节点会盖住线中点）。
-    // 所以再登记一份到 DOM 覆盖层 —— 同一套绘制函数，坐标也一样，只是画到了另一张画布。
+    // ① 「盖在节点之上」的覆盖层绘制 + 可点把手：**与画布实例无关**，先登记。
+    //    dn_overlay.js 自己会轮询等 app.canvas 就绪，所以这里不需要 canvas 就能挂。
+    //    ⚠️ 以前这两条被挡在 drawConnections 的 guard 后面 —— 那个方法一缺，
+    //    连"选中才画一份到最上层"的这份也跟着没了，症状就是"连线一条都不显示"。
+    //    幂等：同名重复登记只是覆盖，看门狗每秒重挂也不会有副作用。
     addForegroundPainter("dn.multilink.selected", (ctx, mainCanvas) => {
         drawVirtualLinks(mainCanvas, ctx, { selectedOnly: true, linesOnly: true });
     });
-    // 中点圆点单独一层，用最高优先级 —— 它必须压在**选中时的金色高亮**之上，
-    // 否则高亮线 8px 的外发光会把序号糊掉（用户实测反馈）。
     addForegroundPainter("dn.multilink.dots", (ctx, mainCanvas) => {
         drawVirtualLinks(mainCanvas, ctx, { selectedOnly: true, dotsOnly: true });
     }, PAINTER_TOP);
-    // 看得见还不够，还得点得到：给每个中点挂透明 DOM 把手（在自绘 UI 之上）。
     addHandleProvider("dn.multilink.handles", virtualLinkHandles);
-    const originalDown = canvas.processMouseDown;
-    canvas.processMouseDown = function (event) {
-        if (!isConnectingMedia(this)) {
-            const [x, y] = getGraphPosition(this, event);
-            const hit = hitTestVirtualLinks(this.graph || app.graph, x, y);
-            if (hit) {
-                openLinkMenu(this, hit, event);
-                event?.preventDefault?.();
-                event?.stopImmediatePropagation?.();
-                return true;
+
+    const canvas = app.canvas;
+    if (!canvas) { dnDiag("patchCanvas:noCanvas"); return; }   /* DIAG */
+    if (!canvas.__dnDiagPatchReported) {   /* DIAG */
+        canvas.__dnDiagPatchReported = true;
+        dnDiag("patchCanvas", {
+            hasCopyFn: typeof canvas.copyToClipboard === "function",
+            alreadyHooked: !!canvas.__DnCopyKeysHooked,
+            hasPasteFn: typeof canvas.pasteFromClipboard === "function",
+            canvasCtor: canvas?.constructor?.name || "",
+        });
+    }
+    // 粘贴入口也记一笔：粘贴前后各拍一次图，用来判断"线是在粘贴瞬间就没了，还是粘贴后几帧被丢的"。
+    if (!canvas.__DnPasteHooked && typeof canvas.pasteFromClipboard === "function") {   /* DIAG */
+        canvas.__DnPasteHooked = true;
+        const originalPaste = canvas.pasteFromClipboard;
+        canvas.pasteFromClipboard = function () {
+            dnDiag("paste:before", { graphNodes: (app.graph?._nodes || []).map(dnBrief) });
+            const result = originalPaste.apply(this, arguments);
+            setTimeout(() => dnDiag("paste:after", {
+                graphNodes: (app.graph?._nodes || []).map(dnBrief),
+                groups: (app.graph?._nodes || []).filter((n) => n?.comfyClass === NODE_CLASS || n?.type === NODE_CLASS)
+                    .map((n) => ({ id: n.id, links: dnBriefLinks(n) })),
+            }), 200);
+            return result;
+        };
+    }
+    // ⚠️ 复制钩子（captureCopyKeys）必须**独立**于 drawConnections 那个 guard 安装：
+    // 真机上 `copyToClipboard` 是 canvas 的原生方法（随 canvas 一起出生），而
+    // `drawConnections` 在某些时序下也可能暂缺；若把复制钩子跟绘图钩子绑在一起、
+    // 被绘图那条 guard 挡掉，复制那一刻就记不下指纹（COPY_KEYS 永远 null），
+    // 老连线一粘贴仍全断 —— 且完全静默、最难查。
+    if (!canvas.__DnCopyKeysHooked && typeof canvas.copyToClipboard === "function") {
+        canvas.__DnCopyKeysHooked = true;
+        const originalCopy = canvas.copyToClipboard;
+        canvas.copyToClipboard = function () {
+            try { captureCopyKeys(canvas); } catch (error) { /* 静默：记不下指纹不影响复制本身 */ }
+            return originalCopy.apply(this, arguments);
+        };
+    }
+    if (!canvas.__DnCopyListenerHooked) {
+        canvas.__DnCopyListenerHooked = true;
+        const onCopy = () => { try { captureCopyKeys(canvas); } catch (error) { /* 静默 */ } };
+        try { document.addEventListener("copy", onCopy, true); } catch (error) { /* 非浏览器环境 */ }
+    }
+    // ② 画线有关的钩子：三条独立判定，谁能装就装谁（见 installDrawHooks 的头注释）。
+    installDrawHooks(canvas);
+    // ③ 点线中点 → 弹菜单。⚠️ 这两条各自带 guard：看门狗每秒都会调 patchCanvas，
+    //    没有 guard 就会一层层套下去（processMouseDown 越包越深、pointerdown 监听器越挂越多）。
+    if (!canvas.__DnMousePatched) {
+        canvas.__DnMousePatched = true;
+        const originalDown = canvas.processMouseDown;
+        canvas.processMouseDown = function (event) {
+            if (!isConnectingMedia(this)) {
+                const [x, y] = getGraphPosition(this, event);
+                const hit = hitTestVirtualLinks(this.graph || app.graph, x, y);
+                if (hit) {
+                    openLinkMenu(this, hit, event);
+                    event?.preventDefault?.();
+                    event?.stopImmediatePropagation?.();
+                    return true;
+                }
             }
-        }
-        return originalDown?.apply(this, arguments);
-    };
-    const linkPointerHandler = (event) => {
-        if (isConnectingMedia(canvas)) return;
-        const [x, y] = getGraphPosition(canvas, event);
-        const hit = hitTestVirtualLinks(canvas.graph || app.graph, x, y);
-        if (!hit) return;
-        openLinkMenu(canvas, hit, event);
-        event.preventDefault?.();
-        event.stopPropagation?.();
-        event.stopImmediatePropagation?.();
-    };
-    canvas.canvas?.addEventListener?.("pointerdown", linkPointerHandler, true);
+            return originalDown?.apply(this, arguments);
+        };
+    }
+    if (!canvas.__DnPointerPatched) {
+        canvas.__DnPointerPatched = true;
+        const linkPointerHandler = (event) => {
+            if (isConnectingMedia(canvas)) return;
+            const [x, y] = getGraphPosition(canvas, event);
+            const hit = hitTestVirtualLinks(canvas.graph || app.graph, x, y);
+            if (!hit) return;
+            openLinkMenu(canvas, hit, event);
+            event.preventDefault?.();
+            event.stopPropagation?.();
+            event.stopImmediatePropagation?.();
+        };
+        canvas.canvas?.addEventListener?.("pointerdown", linkPointerHandler, true);
+    }
 }
 
 /** 在 graphToPrompt 阶段把虚拟连接写成后端隐藏输入 media_1..N。 */
@@ -619,11 +1214,23 @@ function installNode(nodeType, nodeData) {
     const originalConfigured = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function () {
         const result = originalConfigured?.apply(this, arguments);
+        // 打时间戳：跨流粘贴 / 打开工作流的"刚落地"时刻。
+        // normalizeLinks 靠它给悬空连线一个无条件宽限窗口 —— 粘贴首帧读不出
+        // 资产卡身份是**正常现象**，不能当"这张图没有这张卡"处理（删了不可逆）。
+        this.__dnConfiguredAt = Date.now();
         normalizeLinks(this);
         syncNative(this);
         this.setDirtyCanvas?.(true, true);
         return result;
     };
+
+    // ⚠️ 跨画布复制的 source_id 重映射**不**挂在这里 —— 挂在 `onAddedToGraph` 上看似更"权威"，
+    // 但实测本 ComfyUI 版本（秋叶预构建）的 `LGraphNode.prototype.onAddedToGraph` 是 undefined，
+    // 框架根本不调它，挂上去是空壳。真正可靠的触发点是 `normalizeLinks` 本身：它被
+    // `onDrawForeground`（每帧渲染）+ `onConfigure`（图加载）高频调用，节点一在新画布里被画过，
+    // 失效的 source_id 就会被按资产名救回（见 normalizeLinks 内的 remapBrokenLink 调用）。
+    // 若未来升级到带 onAddedToGraph 的 LiteGraph，可在此补一份前置重映射，但**不要删掉
+    // normalizeLinks 里的那份**——它是兜底，onAddedToGraph 只是更早的触发点。
 
     const originalConnections = nodeType.prototype.onConnectionsChange;
     nodeType.prototype.onConnectionsChange = function (type, index, connected, linkInfo) {
@@ -648,7 +1255,7 @@ function installNode(nodeType, nodeData) {
         return result;
     };
 
-    // 节点右键菜单：一键清空 / 反转顺序（比逐个去点线中点方便得多）。
+    // ② 节点右键菜单：一键清空 / 反转顺序（比逐个去点线中点方便得多）。
     const originalMenu = nodeType.prototype.getExtraMenuOptions;
     nodeType.prototype.getExtraMenuOptions = function (canvas, options) {
         const result = originalMenu?.apply(this, arguments);
@@ -669,6 +1276,56 @@ function installNode(nodeType, nodeData) {
     };
 }
 
+/** 安装一张图的事件监听：节点一被 add 进图（Ctrl+V / graph.add / loadGraphData）就
+ *  立即对该图里所有 DN 组跑一次 normalizeLinks → 重映射按资产名救回失效连线。
+ *  这是比"等渲染才触发"更早、更可靠的入口 —— 复制粘贴那一刻连线就被救回，
+ *  不用等到画布画出来。同一张图只挂一次（幂等）。 */
+function installGraphWatcher(graph) {
+    if (!graph || graph.__DnMultiLinkWatched) return;
+    graph.__DnMultiLinkWatched = true;
+    // LiteGraph 的图事件：LGraph.prototype.on(event, cb)。
+    // 节点被 graph.add() 时触发 "node_added"（本版本实测存在；若个别版本没有也不报错）。
+    const fixupAll = () => {
+        for (const node of graph._nodes || []) {
+            if (node?.comfyClass === NODE_CLASS || node?.type === NODE_CLASS) {
+                try { normalizeLinks(node); } catch (error) { /* 静默：下一帧 onDrawForeground 会再跑 */ }
+            }
+        }
+    };
+    const addListener = (event, cb) => {
+        if (typeof graph.on !== "function") return;
+        try { graph.on(event, cb); } catch (error) { /* 旧版 LiteGraph 可能不支持，忽略 */ }
+    };
+    addListener("node_added", (newNode) => {
+        // 只关心"新增的是 DN 组"或"新增的是资产卡（可能是组的来源）"；
+        // 统一对全图 DN 组扫一遍，简单且幂等。
+        setTimeout(fixupAll, 0);
+    });
+    // 图 configure（loadGraphData 后）也跑一次，兜底 loadGraphData 路径。
+    addListener("node_removed", () => { setTimeout(fixupAll, 0); });
+}
+
+/** 给 app 里所有现存图 + 未来切到的新图挂上监听（app.setGraph / 新建时调用）。 */
+function watchAllGraphs() {
+    try {
+        if (app.graph) installGraphWatcher(app.graph);
+    } catch (error) { /* app 还没就绪 */ }
+    // 钩 app.setGraph：用户切工作流 / 新建流时给新图也挂上。
+    if (typeof app.setGraph === "function" && !app.__DnMultiLinkSetGraphHooked) {
+        app.__DnMultiLinkSetGraphHooked = true;
+        const originalSetGraph = app.setGraph;
+        app.setGraph = function (graph, ...rest) {
+            const result = originalSetGraph.apply(this, arguments);
+            try { installGraphWatcher(graph); } catch (error) { /* 静默 */ }
+            // ⚠️ 切工作流时 `app.canvas` 可能被整个换掉（新 canvas 上没有任何我们的
+            //    钩子：复制不抓指纹、虚拟连线不画）。这里补一次幂等的重装 ——
+            //    patchCanvas 内部每一条都有自己的 guard，重复调用只做"缺哪条补哪条"。
+            try { patchCanvas(); } catch (error) { /* 静默 */ }
+            return result;
+        };
+    }
+}
+
 /** 注册扩展并在画布初始化后安装补丁。
  *  注意：注册必须「等 app 就绪」再调 —— ComfyUI 并行 import 所有扩展脚本，文件越小越先执行，
  *  那时 window.app 可能还没赋值，顶层直接 `app.registerExtension(...)` 会 ReferenceError
@@ -681,11 +1338,21 @@ const extension = {
         const installPatches = (attempt = 0) => {
             patchGraphToPrompt();
             patchCanvas();
-            if (attempt < 8 && (!app.__DnMultiLinkPromptPatched || !app.canvas?.__DnMultiLinkPatched)) {
+            // 给当前图 + 未来切到的新图挂 node_added 监听：复制粘贴那一刻就救回失效连线。
+            try { watchAllGraphs(); } catch (error) { /* app.graph 可能还没就绪，下轮再挂 */ }
+            // ⚠️ 这段轮询只负责"开跑头几秒"的追赶，**长期由看门狗兜底**（前端会整个换掉
+            //    画布实例，而这里 12×250ms 就结束了）。判据改成"画线钩子里任意一条装上了"，
+            //    不再死盯 drawConnections —— 否则它一直缺，这里就一直白转、最后什么都没有。
+            const canvasReady = !!(app.canvas?.__DnForegroundPatched
+                && (app.canvas?.__DnMultiLinkPatched || app.canvas?.__DnBackPatched)
+                && app.canvas?.__DnCopyKeysHooked);
+            if (attempt < 12 && (!app.__DnMultiLinkPromptPatched || !canvasReady)) {
                 setTimeout(() => installPatches(attempt + 1), 250);
             }
         };
         installPatches();
+        // 画布被换掉（Vue 重挂 / 切工作流 / 刚给节点挂上 DOM 控件那一下）时自动补装。
+        try { startCanvasWatchdog(); } catch (error) { /* 静默：下一帧 onDrawForeground 还会试 */ }
     },
     beforeRegisterNodeDef(nodeType, nodeData) {
         installNode(nodeType, nodeData);

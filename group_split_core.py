@@ -35,11 +35,15 @@ AUDIO_OUTPUT_NAMES = tuple(f"audio_{i}" for i in range(1, MAX_SPLIT_AUDIOS + 1))
 
 #: 由本节点动态生成的输出口（前端按数量增删的就是这些）。
 MANAGED_OUTPUT_NAMES = IMAGE_OUTPUT_NAMES + VIDEO_OUTPUT_NAMES + AUDIO_OUTPUT_NAMES
-#: 固定不动的输出口 —— 提示词放在**所有素材口之下**（前端重建时会保持它在最后）。
+#: 固定不动的输出口 —— 提示词放在**所有素材口之下**（前端重建时会保持它在倒数第二）。
 PROMPT_OUTPUT_NAME = "prompt"
+#: 固定不动的输出口 —— 时长（秒），紧跟在提示词之后、排在**最下边**（前端固定口）。
+#: 值来自分组字典的 duration_sec（上游「资产卡镜头打包」打包时已写入）。
+DURATION_OUTPUT_NAME = "duration"
 
 #: 节点声明用的完整输出名（前端会把 managed 的那些从节点定义里剔掉再按数量重建）。
-DECLARED_OUTPUT_NAMES = MANAGED_OUTPUT_NAMES + (PROMPT_OUTPUT_NAME,)
+#: 顺序约定：素材口（动态）→ prompt（固定）→ duration（固定，最下边）。
+DECLARED_OUTPUT_NAMES = MANAGED_OUTPUT_NAMES + (PROMPT_OUTPUT_NAME, DURATION_OUTPUT_NAME)
 
 #: 三个数量控件的 key（顺序 = 界面顺序 = 输出口顺序）。
 COUNT_KEYS = ("image_count", "video_count", "audio_count")
@@ -78,12 +82,15 @@ def ordered_media(mapping: Any) -> list[Any]:
     return [value for _order, value in items]
 
 
-def as_group(value: Any) -> dict[str, Any]:
+def as_group(value: Any, who: str = "资产卡Group拆分") -> dict[str, Any]:
     """取出单个分组字典。
 
     - ``dict`` → 本身
     - ``list`` / ``tuple``（多半是接到了 Groups Combine 上）→ 取第一个字典，其余忽略
     - 其它 → 抛 ValueError（报错要说清接的是什么）
+
+    ``who`` 只用于报错前缀（「资产卡Group拆分」/「资产卡任务台」共用这一份校验，
+    免得两处规则各写一遍、哪天改了只改一处）。
     """
     if isinstance(value, dict):
         return value
@@ -92,11 +99,11 @@ def as_group(value: Any) -> dict[str, Any]:
             if isinstance(item, dict):
                 return item
         raise ValueError(
-            "资产卡Group拆分：group 收到了列表，但里面没有分组字典。"
-            "请把「资产卡 to Director Group」的 group 输出直接接到本节点。"
+            f"{who}：group 收到了列表，但里面没有分组字典。"
+            "请把「资产卡镜头打包」的 group 输出直接接到本节点。"
         )
     raise ValueError(
-        "资产卡Group拆分：group 必须是导演台分组（MMX_DIR_GROUP），"
+        f"{who}：group 必须是导演台分组（MMX_DIR_GROUP），"
         f"实际收到 {type(value)!r}。"
     )
 
@@ -132,6 +139,15 @@ def group_prompt(group: dict[str, Any]) -> str:
     """分组里的提示词（``None`` → 空串，便于直接接文本节点）。"""
     value = group.get("prompt")
     return "" if value is None else str(value)
+
+
+def group_duration(group: dict[str, Any]) -> float:
+    """分组里的时长（秒）。取不到时返回 5.0（与上游打包默认时长一致）。"""
+    value = group.get("duration_sec")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 5.0
 
 
 def split_group(

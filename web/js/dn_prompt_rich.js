@@ -1,7 +1,7 @@
 import { app } from "../../../scripts/app.js";
 
 /*
- * 资产卡 to Director Group —— 提示词富文本编辑器。
+ * 资产卡镜头打包 —— 提示词富文本编辑器。
  *
  * 目标：把 prompt 从"一坨纯文本"变成"看得懂、改得动"的结构化视图。
  *
@@ -380,6 +380,9 @@ function resolveMedia(node) {
     const assets = [];
     /* 有音、但这条音被关掉（卡片静音 or 本段不带音）的卡 —— 只用于提示，不参与编号。 */
     const audiosOff = [];
+    /* 每张图对应的参考音频文件名（**最终**会被送进分组的那条音；被静默的为空串）——
+       给「参考音频定说话人」用，见 audioSpeakerInWindow。 */
+    const pictureAudio = new Map();
     for (const { info } of kept) {
         if (info.image) {
             pictures.push({
@@ -389,6 +392,7 @@ function resolveMedia(node) {
                 role: info.role,
                 sourceNode: info.node,
             });
+            pictureAudio.set(info.image, info.audio || "");
         }
         if (info.audio) {
             audios.push({
@@ -418,6 +422,7 @@ function resolveMedia(node) {
     return {
         pictures, videos: [], audios, assets,
         audiosOff,
+        pictureAudio,   // 图片 → 参考音频文件名（给「参考音频定说话人」用）
         audioOverflow,
         imageOverflow,
         overflowImages: pictures.slice(MAX_IMAGES),
@@ -502,6 +507,13 @@ export function resolveMediaCounts(node) {
  * 这样比原来的"前 60 字里搜名字"稳得多，也不会被别的角色名串了台。
  * ================================================================ */
 
+/** 背景音乐的 asset 名：含这些字段的卡不算说话人参考音（它们的 audio 是 BGM）。 */
+const BGM_ROLE_RE = /\b(bg|bgs)\b/i;
+
+/* 找参考音频定说话人时，往对话前面扫多远（字符数）。
+ * 太长容易串台；800 ≈ 一段提示词的核心内容长度。 */
+const AUDIO_SPEAKER_SEARCH_WINDOW = 800;
+
 function buildSpeakerMap(text, media) {
     const map = new Map();
     SUBJECT_RE.lastIndex = 0;
@@ -549,9 +561,102 @@ function speakerFromSegment(seg, media, speakerMap, allowLoose) {
     return null;
 }
 
+/** 在对话块"前方不远"里找参考音频定义的说话人。
+ *
+ *  H3 规范：一张卡挂的参考音频 = 这张卡对应角色的音色。常见写法是把
+ *  "声音参考 <Audio N> 的音色"写在对话块**紧前面**，形如：
+ *    <Audio 1> 的音色：<d>[Chinese] 我靠！地震了吗？</d>
+ *  这里 `<Audio N>` 的数字 N **直接对应 `media.audios[N-1]`**（第 N 条参考音频，
+ *  后端编号），那张卡的资产名就是这段对话的说话人 —— 比资产名"最近被提到"
+ *  更可靠，因为音色是作者**显式**绑给这段的。
+ *
+ *  优先级：最高 —— 比 (Sx) / <Subject N> / 资产名都高。
+ *
+ *  识别策略（两层）：
+ *  1. **主策略：`<Audio N>` 数字映射** —— 在对话前方 800 字窗口内找所有 `<Audio N>`
+ *     标签（N 必须在 1..media.audios.length 范围内），取**最近出现**的那个，
+ *     直接拿 `media.audios[N-1].role` 作为说话人。
+ *  2. **兜底策略：资产名 + 参考音频** —— 主策略没命中时，退回"窗口内最近被提到的、
+ *     且有参考音频"的资产名。
+ *
+ *  边界：
+ *  - 窗口起点 = 对话前最近一个 `<Picture N>` 之后（"前方不远处"的锚点），
+ *    长度受 AUDIO_SPEAKER_SEARCH_WINDOW 限制，避免跨长串提示词跑到前一段去。
+ *  - 背景音乐 / BGM 类文件名（bg_melody、bgm_…）不算说话人参考音。
+ *  - 多张卡都有音频且都被提到时，取**在窗口里最近一次被提到**的那张，
+ *    避免"前面的场景提过一次、这段其实另一个人"这种串台。
+ *
+ *  ⚠️ `media` 必传：pictures 里没存音频（音频在独立 `audios` 数组里），
+ *  本函数靠 `media.audios` 按编号反查资产名。 */
+function audioSpeakerInWindow(text, dialogueIndex, media, dialogueEnd) {
+    if (!dialogueIndex || dialogueIndex <= 0 || !media) return null;
+    const audios = media.audios || [];
+    if (!audios.length) return null;
+    // 窗口终点：对话块**末尾**（dialogueEnd）—— 音频声明通常就在对话**紧前面**
+    // （「<Audio 1> 的音色：<d>…」），只看到 index（<d> 起点）会丢掉那几十字。
+    const end = Number(dialogueEnd) || dialogueIndex;
+    const windowStart = Math.max(0, end - AUDIO_SPEAKER_SEARCH_WINDOW);
+    const segment = text.slice(windowStart, end);
+
+    // 主策略：<Audio N> 数字映射（N 在 1..audios.length 范围内才认）
+    const audioTagRe = /<Audio\s+(\d+)>/g;
+    let bestAudioTag = null;
+    for (const m of segment.matchAll(audioTagRe)) {
+        const n = Number(m[1]);
+        if (n < 1 || n > audios.length) continue;     // 超出的编号 = 后端不存在，忽略
+        const audio = audios[n - 1];
+        if (!audio) continue;
+        if (BGM_ROLE_RE.test(audio.role || "") || BGM_ROLE_RE.test(audio.filename || "")) continue;
+        bestAudioTag = { index: m.index, role: audio.role, filename: audio.filename };   // 顺序遍历 → 离对话最近
+    }
+    if (bestAudioTag) {
+        return {
+            name: bestAudioTag.role,
+            via: `参考音频 (<Audio ${audios.findIndex((a) => a.filename === bestAudioTag.filename) + 1}> ${bestAudioTag.filename})`,
+        };
+    }
+
+    // 兜底策略：资产名 + 参考音频（窗口内最近一次被提到、且确实有参考音频的那张卡）
+    let lastPicture = null;
+    for (const m of text.slice(0, dialogueIndex).matchAll(TAG_RE)) {
+        if (m[1] === "Audio") continue;
+        if (Number(m[2]) > (media.pictures || []).length) continue;
+        lastPicture = m;
+    }
+    const start = lastPicture ? Math.max(windowStart, lastPicture.index + lastPicture[0].length) : windowStart;
+    const nearSegment = text.slice(start, end);
+    if (!nearSegment.trim()) return null;
+    const mentionPos = new Map();
+    for (const name of media.assets) {
+        if (!name) continue;
+        const at = nearSegment.lastIndexOf(name);
+        if (at < 0) continue;
+        mentionPos.set(name, at + start);
+    }
+    if (!mentionPos.size) return null;
+    let best = null;
+    for (const [role, at] of mentionPos) {
+        if (BGM_ROLE_RE.test(role)) continue;
+        const audioFile = (media.audios || []).find((a) => a.role === role)?.filename || "";
+        if (!audioFile || BGM_ROLE_RE.test(audioFile || "")) continue;
+        if (!best || at > best.at) best = { role, at, audioFile };
+    }
+    if (!best) return null;
+    return { name: best.role, via: `参考音频 (${best.audioFile})` };
+}
+
 /** 对话块的说话人：优先同段，找不到再看"上一个对话块之后"那点文字（对话常另起一行写）。
- *  绝不跨过上一个 </d> —— 那些字是上一句话的归属，拿来当这一句的说话人会串台。 */
+ *  绝不跨过上一个 </d> —— 那些字是上一句话的归属，拿来当这一句的说话人会串台。
+ *
+ *  ⚠️ 引入「参考音频定说话人」后，`speakerFromSegment` 只负责文本侧识别；
+ *  音频侧识别拆成独立函数并在本函数里先跑，避免污染原有路径。 */
 function speakerForDialogue(text, index, media, speakerMap) {
+    // ① 参考音频优先：在 `<Picture N>` 之后不远处找有音频的卡，直接拿它的资产名。
+    //   传上 dialogueEnd = index + 整个 <d> 块长度，让窗口包含「对话本身 + 紧前面的几十字」，
+    //   因为 H3 规范里音色声明就写在 `<Audio N> 的音色：` 紧前面。
+    const dialogueEnd = (text.indexOf("</d>", index) + 4) || (index + 200);
+    const audioWho = audioSpeakerInWindow(text, index, media, dialogueEnd);
+    if (audioWho) return audioWho;
     const paraStart = text.lastIndexOf("\n", index - 1) + 1;
     const same = speakerFromSegment(text.slice(paraStart, index), media, speakerMap, true);
     if (same) return same;
@@ -2510,10 +2615,18 @@ const NAV_KEYS = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Ho
  *  于是判断失败 → 当成画布按键吃掉 → 光标一动不动（打字正常是因为输入走的是编辑命令，不是 keydown 默认动作）。
  *  对照组：同样一段文字放在 light-DOM 的 contenteditable 里，方向键完全正常。
  *
- *  做法：在 **window 捕获阶段**（比 document/canvas 那层更早）认出"落在我们编辑器上的导航键"，
+ *  ⚠️ **判定必须同时认「美容态」和「原文态」两块编辑控件**（2026-09-30 补）：
+ *  原文模式的输入件是我们自己的 `textarea.dnp-raw`，它**同样挂在 shadow root 里**
+ *  （见 ensureEditor：`(root === wrap ? wrap : root).append(bar, filterWarn, editor, rawBox)`），
+ *  于是**同一个重定向问题原样复现** —— 早期版本只找 `EDITOR_CLASS`，原文模式下方向键照旧被画布吃掉。
+ *  实测（`dn_rawkey_probe.mjs`，节点 121，textarea 光标在 index 10）：
+ *    基线 `focused=true, selected=[121]` → 按 ArrowRight×3 → `focused=false, selected=[157]`、`selectionStart` 纹丝不动。
+ *  注意它还**顺手把焦点抢到画布上**（`document.activeElement` 变成 BODY），所以只修方向键不够 ——
+ *  焦点一丢，后续 Backspace/Delete 也一起失效。把宿主范围内的编辑控件全纳入，才是这个 bug 的完整修复。
+ *
+ *  做法：在 **window 捕获阶段**（比 document/canvas 那层更早）认出"落在我们编辑控件上的导航键"，
  *  **只 `stopPropagation()`、绝不 `preventDefault()`** —— 浏览器默认的光标移动保留，
- *  外层那套画布快捷键再也看不到这些事件。@ 菜单打开时放行，键盘才能上下选。
- */
+ *  外层那套画布快捷键再也看不到这些事件。@ 菜单打开时放行，键盘才能上下选。 */
 function installNavKeyGuard() {
     if (window.__dnpNavGuard) return;
     window.__dnpNavGuard = true;
@@ -2521,9 +2634,10 @@ function installNavKeyGuard() {
         try {
             if (!NAV_KEYS.has(event.key)) return;
             const path = typeof event.composedPath === "function" ? event.composedPath() : [];
-            const editor = path.find((n) => n?.nodeType === 1 && n.classList?.contains(EDITOR_CLASS));
-            if (!editor) return;
-            const node = editor.__dnpPromptNode;
+            const holder = path.find((n) => n?.nodeType === 1
+                && (n.classList?.contains(EDITOR_CLASS) || n.classList?.contains(RAW_CLASS)));
+            if (!holder) return;
+            const node = holder.__dnpPromptNode;
             if (node && activeMenu && activeMenu.node === node) return;   // 菜单开着 → 留给菜单导航
             event.stopPropagation();
         } catch (error) { /* 静默：这只是按键放行 */ }

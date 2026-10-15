@@ -32,7 +32,11 @@ const PROP_TRIM_END = "pml_trim_end";
 const PROP_AUDIO_MUTED = "pml_audio_muted";
 
 /* ----------------------------- 布局 ----------------------------- */
-const NODE_WIDTH = 480;
+/* 默认尺寸 = 手动调好的那一版（2026-09-30 用户要求）。
+   原先是 480 宽，实际用起来太占地方；参考《我的世界1海螺H3_资产卡&导演台DN.json》
+   里 12 张手调过的卡，宽度集中在 320.7、高度 478.9（取众数），凑整成 320 × 480。
+   高度这边其实不用改：下面的 DEFAULT_HEIGHT 公式算出来正好就是 480，与手调值吻合。 */
+const NODE_WIDTH = 320;
 const IMAGE_H = 148;
 // 波形区高度：75 → 38（上下砍掉约一半），画布按 clientHeight 自适应，无需改绘制逻辑。
 const WAVEFORM_H = 38;
@@ -56,7 +60,9 @@ const TEXT_NODE_BOTTOM_MARGIN = 8;
 const TEXT_HEIGHT_OFFSET = 30;
 const ROLE_NAME_TOP_GAP = 14;
 const DEFAULT_HEIGHT = CONTENT_H + CHROME + ROLE_NAME_TOP_GAP + TEXT_WIDGET_MIN_H + TEXT_BOTTOM_GAP + TEXT_NODE_BOTTOM_MARGIN + 50;
-const MIN_WIDTH = 340;
+/* 最小宽度必须 ≤ NODE_WIDTH，否则新节点一建出来就"不合法"、被反复重置。
+   取 300 而非 320：给想再拖窄一点的人留余量（手调值是 320.7，本来就贴着边界）。 */
+const MIN_WIDTH = 300;
 const MIN_HEIGHT = DEFAULT_HEIGHT;
 const SIZE_SANITY_MAX = 4096;
 

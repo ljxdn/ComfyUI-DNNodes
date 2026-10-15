@@ -44,7 +44,7 @@ IMAGE_EXTS = {
 }
 
 # 「最长边」限制：只等比缩小，绝不放大。
-# 取值与算法同 ComfyUI-DNNodes 的 media_group_core（DN H3 Media to Director Group）。
+# 取值与算法同 ComfyUI-DNNodes 的 media_group_core（DN Asset Card Shot）。
 MAX_EDGE_LIMIT = 4096      # 节点 UI 上的最大值
 DEFAULT_MAX_EDGE = 1440    # 默认值：最长边超过 1440 就缩到 1440
 MIN_MAX_EDGE = 32          # 节点 UI 上的最小值

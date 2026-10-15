@@ -3,10 +3,21 @@ import { addForegroundPainter, drawVirtualDot, PAINTER_TOP, VIRTUAL_DOT_INACTIVE
 import { getLinkBadges } from "./dn_prompt_rich.js";
 
 /*
- * DN 节点「选中即高亮上游」。
+ * DN 节点「选中即高亮关联」—— 双向。
  *
- * 选中「资产卡 to Director Group」时，把它这一段视频真正吃进去的
- * **上游连线 + 上游节点**高亮出来，方便核对"到底用了哪几张卡"。
+ * 【方向 A：选中「资产卡镜头打包」→ 高亮上游】
+ * 把它这一段视频真正吃进去的 **上游连线 + 上游节点（资产卡）**高亮出来，
+ * 方便核对"到底用了哪几张卡"。
+ *
+ * 【方向 B：选中「资产卡（H3MediaLoader）」→ 高亮下游】（2026-09-30 加）
+ * 反过来点亮这张卡连到的每个「资产卡镜头打包」+ 两者之间的连线，
+ * 方便核对"这张卡被哪些段用到了"。与方向 A 是同一套几何，只有两处刻意不同：
+ *   · 颜色用 **H3_MEDIA 连线本身的颜色**（与 dn_media_multilink.js 画虚拟连线
+ *     取的是同一个来源：LGraphCanvas.link_type_colors.H3_MEDIA，缺失时 fallback
+ *     #34d399），这样一眼能看出"现在是哪个方向在看"，不会和方向 A 的琥珀金混淆；
+ *   · **不画连线中点的序号圆点**：圆点是"组视角"的信息（这条线在本组排第几），
+ *     且 dn_media_multilink 只在**组被选中**时才给它挂可点把手 —— 这里画了却点不动，
+ *     反而像坏了（见 skill §5.12.1"看得见不等于点得到"）。
  *
  * 设计要点（都是刻意为之）：
  * 1. **只画、不改图对象**：绝不动 node.color / bgcolor / link.color ——
@@ -16,11 +27,14 @@ import { getLinkBadges } from "./dn_prompt_rich.js";
  *    "只亮一个节点、线却是断的"。只要被点亮的节点自己有虚拟连线，就继续跟随。
  * 3. **真实连线只走一层**：否则会顺着 prompt 一路点亮到模型加载器 / LoRA / VAE，
  *    灯光乱成一片。要更远把 HOP_LIMIT 调大即可。
- * 4. 颜色用琥珀金（#f5b942），和节点选中白框、H3_MEDIA 的绿色线都不撞。
- * 5. 只在"选中了 DN 节点"时才有开销；其余时候首行就返回。
+ * 4. 方向 A 用琥珀金（#f5b942），方向 B 用 H3_MEDIA 连线色（#34d399），
+ *    两者都不与节点选中白框撞色。
+ * 5. 只在"选中的节点里有 DN 组 / 资产卡"时才有开销；其余时候首行就返回。
  */
 
 const NODE_CLASS = "DNMediaToDirectorGroup";
+/* 资产卡（前端类名仍是 H3MediaLoader，见 asset_card.js 顶部说明） */
+const CARD_CLASS = "H3MediaLoader";
 
 /* 媒体输入名：真实连线的入口只认这些 */
 const MEDIA_INPUT_RE = /^media_[1-9]$/;
@@ -39,20 +53,40 @@ const COLOR = "#f5b942";
 const COLOR_SOFT = "rgba(245, 185, 66, 0.28)";
 const RING_PAD = 4;
 
+/* 方向 B（选中资产卡）用的连线色：H3_MEDIA 连线本身是什么色就用什么色。
+   LGraphCanvas.link_type_colors 里自定义类型常常是 null（本机实测 H3_MEDIA 就没登记），
+   缺了就会画成透明 → 必须有 fallback，且与 dn_media_multilink.js 的 fallback 保持一致。 */
+const MEDIA_LINK_FALLBACK = "#34d399";
+const SOFT_ALPHA = 0.28;
+
+/** 取 H3_MEDIA 连线颜色（惰性读：并行 import 期间 LGraphCanvas 可能还没挂上）。 */
+function mediaLinkColor() {
+    const value = globalThis.LGraphCanvas?.link_type_colors?.H3_MEDIA;
+    return typeof value === "string" && value ? value : MEDIA_LINK_FALLBACK;
+}
+
+/** 把 #rrggbb 转成同色的半透明 rgba()；认不出的写法原样返回（不猜、不改）。 */
+function withAlpha(color, alpha) {
+    const match = /^#([0-9a-fA-F]{6})$/.exec(String(color || "").trim());
+    if (!match) return color;
+    const n = parseInt(match[1], 16);
+    return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+}
+
 /** 是否是媒体输入名（medias / media_1..9）。 */
 function isMediaInputName(name) {
     return name === "medias" || MEDIA_INPUT_RE.test(String(name));
 }
 
-/** 取当前选中的 DN 节点（兼容 selected_nodes 与 selectedItems 两种形态）。 */
-function selectedTargets() {
+/** 当前选中的、满足 predicate 的节点（兼容 selected_nodes 与 selectedItems 两种形态）。 */
+function selectedNodesOf(predicate) {
     const canvas = app?.canvas;
     if (!canvas) return [];
     const out = [];
     const seen = new Set();
     const push = (node) => {
         if (!node || seen.has(node.id)) return;
-        if (node.comfyClass !== NODE_CLASS && node.type !== NODE_CLASS) return;
+        if (!predicate(node)) return;
         seen.add(node.id);
         out.push(node);
     };
@@ -64,6 +98,26 @@ function selectedTargets() {
     const items = canvas.selectedItems;
     if (items && typeof items.forEach === "function") items.forEach(push);
     return out;
+}
+
+/** 是否是「资产卡镜头打包」节点。 */
+function isGroupNode(node) {
+    return node?.comfyClass === NODE_CLASS || node?.type === NODE_CLASS;
+}
+
+/** 是否是「资产卡」节点。 */
+function isCardNode(node) {
+    return node?.comfyClass === CARD_CLASS || node?.type === CARD_CLASS;
+}
+
+/** 取当前选中的 DN 组（方向 A 的起点）。 */
+function selectedTargets() {
+    return selectedNodesOf(isGroupNode);
+}
+
+/** 取当前选中的资产卡（方向 B 的起点）。 */
+function selectedCards() {
+    return selectedNodesOf(isCardNode);
 }
 
 /** 从一个 link 对象/id 解析出来源节点与输出槽。 */
@@ -95,10 +149,15 @@ function virtualLinksOf(node) {
     return out;
 }
 
-/** 收集以 targets 为终点的上游连线与上游节点。 */
+/** 收集以 targets 为终点的上游连线与上游节点。
+ *
+ *  ⚠️ `nodes` 的 value 是**节点本身**（不是 `{ node, hop }` 之类的包装对象）——
+ *  ringNodes() 是方向 A/B 共用的，两边的 Map 必须同构。hop 只在本函数的
+ *  queue 里传递，别塞回 Map（2026-09-30 踩过：把包装对象留在 Map 里，
+ *  共用方按裸节点取 `node.pos` → 全部 undefined，描边一环都画不出来）。 */
 function collectUpstream(targets) {
     const graph = app?.graph;
-    const nodes = new Map();   // id -> { node, hop }
+    const nodes = new Map();   // id -> 节点本身（裸节点，与 collectDownstream 同构）
     const links = [];          // { fromNode, fromSlot, toNode, virtual }
     const queue = [];
     const visited = new Set();
@@ -120,7 +179,7 @@ function collectUpstream(targets) {
                 if (!src || src.id === node.id) continue;
                 links.push({ fromNode: src.node, fromSlot: src.slot, toNode: node, virtual: false });
                 if (!nodes.has(src.id)) {
-                    nodes.set(src.id, { node: src.node, hop: hop + 1 });
+                    nodes.set(src.id, src.node);
                     if (!visited.has(src.id)) { visited.add(src.id); queue.push({ node: src.node, hop: hop + 1 }); }
                 }
             }
@@ -133,7 +192,7 @@ function collectUpstream(targets) {
             if (!src) continue;
             links.push({ fromNode: src, fromSlot: item.source_slot, toNode: node, virtual: true });
             if (!nodes.has(src.id)) {
-                nodes.set(src.id, { node: src, hop: hop + 1 });
+                nodes.set(src.id, src);
                 if (!visited.has(src.id)) { visited.add(src.id); queue.push({ node: src, hop: hop + 1 }); }
             }
         }
@@ -181,10 +240,66 @@ function mediaPortPos(node) {
     return inputPos(node, index);
 }
 
+/* ------------------------------------------------------------------
+ * 方向 B：选中资产卡 → 下游（DN 组 + 连线）
+ * ------------------------------------------------------------------ */
+
+/** 收集以选中的资产卡为起点的下游连线与下游节点（= 用到这张卡的 DN 组）。
+ *
+ *  与 collectUpstream 对称：一个从组往下找卡，一个从卡往上找组。
+ *  两种连法都要认：
+ *    ① **虚拟连线** —— 本包 dn_media_multilink.js 把 medias 端口的多条连线存在
+ *       **DN 组自己**的 properties.dn_media_to_group_links 里（`{source_id, source_slot}`），
+ *       所以必须遍历所有 DN 组去看"哪几条记录的 source_id 是这张卡"。
+ *       ⚠️ 反查方向注意：记录挂在**组**上，不是挂在卡上，别指望从卡上能读到。
+ *    ② **真实连线** —— 老工作流还没被收编（懒收编，见 dn_media_multilink.js 顶部）时，
+ *       端口上就是一条真的原生连线，此时卡在组的 media_N / medias 输入口上。 */
+function collectDownstream(cards) {
+    const graph = app?.graph;
+    const nodes = new Map();   // id -> 组节点
+    const links = [];          // { fromNode(卡), fromSlot, toNode(组), virtual }
+    if (!graph?._nodes || !cards.length) return { nodes, links };
+
+    const cardIds = new Set(cards.map((card) => Number(card.id)));
+    const seen = new Set();
+
+    for (const group of graph._nodes) {
+        if (!isGroupNode(group)) continue;
+
+        // ① 虚拟连线
+        for (const item of virtualLinksOf(group)) {
+            if (!cardIds.has(Number(item.source_id))) continue;
+            const key = `v:${item.source_id}:${item.source_slot}:${group.id}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const card = graph.getNodeById?.(Number(item.source_id));
+            if (!card) continue;
+            links.push({ fromNode: card, fromSlot: item.source_slot, toNode: group, virtual: true });
+            nodes.set(group.id, group);
+        }
+
+        // ② 真实连线
+        for (const input of group.inputs || []) {
+            if (!input || !isMediaInputName(input.name) || input.link == null) continue;
+            const src = sourceOf(group.graph || graph, input.link);
+            if (!src || !cardIds.has(Number(src.id))) continue;
+            const key = `n:${src.id}:${src.slot}:${group.id}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            links.push({ fromNode: src.node, fromSlot: src.slot, toNode: group, virtual: false });
+            nodes.set(group.id, group);
+        }
+    }
+    return { nodes, links };
+}
+
 /** 画一条高亮连线（在原有连线之上叠一层，不改原 line 对象）。
- *  `off` = 这张卡「资产名不在提示词里、不会被收进分组」→ 高亮也压灰，别再给它镀金。 */
-function strokeLink(ctx, from, to, off) {
+ *  `off` = 这张卡「资产名不在提示词里、不会被收进分组」→ 高亮也压灰，别再给它镀金。
+ *  `style` = { color, soft }，缺省是方向 A 的琥珀金；方向 B 传 H3_MEDIA 连线色。 */
+function strokeLink(ctx, from, to, off, style) {
     if (!from || !to) return;
+    const color = style?.color || COLOR;
+    const soft = style?.soft || withAlpha(color, SOFT_ALPHA);
     if (off) {
         ctx.save();
         ctx.beginPath();
@@ -203,14 +318,14 @@ function strokeLink(ctx, from, to, off) {
     ctx.moveTo(from[0], from[1]);
     ctx.bezierCurveTo(from[0] + 80, from[1], to[0] - 80, to[1], to[0], to[1]);
     ctx.lineWidth = 8;
-    ctx.strokeStyle = COLOR_SOFT;
+    ctx.strokeStyle = soft;
     ctx.stroke();
     ctx.beginPath();
     ctx.moveTo(from[0], from[1]);
     ctx.bezierCurveTo(from[0] + 80, from[1], to[0] - 80, to[1], to[0], to[1]);
     ctx.lineWidth = 3;
-    ctx.strokeStyle = COLOR;
-    ctx.shadowColor = COLOR;
+    ctx.strokeStyle = color;
+    ctx.shadowColor = color;
     ctx.shadowBlur = 10;
     ctx.stroke();
     ctx.restore();
@@ -286,24 +401,20 @@ function titleHeight() {
     return Number.isFinite(v) && v > 0 ? v : 30;
 }
 
-/** 高亮节点描边层（画在节点之上，所以边框不会被节点本身盖住）。
- *  「资产名不在提示词里」的卡：圈也压灰（无外发光），不再镀金 —— 金光 = 后端真的会用它。 */
-function drawNodeRings(ctx) {
-    const targets = selectedTargets();
-    if (!targets.length) return;
-    const { nodes, links } = collectUpstream(targets);
-    if (!nodes.size) return;
-    const offIds = new Set();
-    const cache = new Map();
-    for (const item of links) {
-        const id = Number(item.fromNode?.id);
-        if (badgesFor(cache, item.toNode).get(id)?.off) offIds.add(id);
-    }
+/** 给一批节点描一圈（画在节点之上，所以边框不会被节点本身盖住）。
+ *  `style` = { color, soft }；被判定 off（不会真的生效）的节点统一压灰、去外发光。 */
+function ringNodes(ctx, nodeMap, offIds, style) {
+    if (!nodeMap.size) return;
+    const color = style?.color || COLOR;
+    const soft = style?.soft || withAlpha(color, SOFT_ALPHA);
     const scale = app?.canvas?.ds?.scale || 1;
     const lineWidth = 2.5 / scale;
     const th = titleHeight();
     ctx.save();
-    for (const { node } of nodes.values()) {
+    for (const item of nodeMap.values()) {
+        // 值可能是裸节点，也可能是 `{ node, … }` 包装（历史收集器差异）——都拆开吃。
+        // 不拆的话 node.pos 是 undefined，会被下面的 continue **静默**吃掉、一环都不画（2026-09-30 的教训）。
+        const node = item?.node?.pos ? item.node : item;
         const pos = node?.pos;
         const size = node?.size;
         if (!pos || !size) continue;
@@ -327,18 +438,69 @@ function drawNodeRings(ctx) {
         ctx.quadraticCurveTo(x, y, x + r, y);
         ctx.closePath();
         ctx.lineWidth = lineWidth + 2 / scale;
-        ctx.strokeStyle = off ? "rgba(119,129,125,0.25)" : COLOR_SOFT;
-        ctx.shadowColor = off ? "#77817d" : COLOR;
+        ctx.strokeStyle = off ? "rgba(119,129,125,0.25)" : soft;
+        ctx.shadowColor = off ? "#77817d" : color;
         ctx.shadowBlur = off ? 0 : 14;
         ctx.stroke();
         ctx.lineWidth = lineWidth;
-        ctx.strokeStyle = off ? "#77817d" : COLOR;
+        ctx.strokeStyle = off ? "#77817d" : color;
         ctx.stroke();
     }
     ctx.restore();
 }
 
-/** 覆盖画布绘制：连线层 + 前景层（节点描边）。 */
+/** 方向 A 的描边层（选中的 DN 组 → 它的上游资产卡）。
+ *  「资产名不在提示词里」的卡：圈也压灰（无外发光），不再镀金 —— 金光 = 后端真的会用它。 */
+function drawNodeRings(ctx) {
+    const targets = selectedTargets();
+    if (!targets.length) return;
+    const { nodes, links } = collectUpstream(targets);
+    if (!nodes.size) return;
+    const offIds = new Set();
+    const cache = new Map();
+    for (const item of links) {
+        const id = Number(item.fromNode?.id);
+        if (badgesFor(cache, item.toNode).get(id)?.off) offIds.add(id);
+    }
+    ringNodes(ctx, nodes, offIds);
+}
+
+/* ------------------------------------------------------------------
+ * 方向 B 的绘制：连线用 H3_MEDIA 连线色，节点用同色描边
+ * ------------------------------------------------------------------ */
+
+/** 下游连线层：从资产卡的输出口画到每个用到它的 DN 组的 medias 口。 */
+function drawDownstreamLinks(ctx) {
+    const cards = selectedCards();
+    if (!cards.length) return;
+    const { links } = collectDownstream(cards);
+    if (!links.length) return;
+    const style = { color: mediaLinkColor(), soft: withAlpha(mediaLinkColor(), SOFT_ALPHA) };
+    const cache = new Map();
+    for (const item of links) {
+        const from = outputPos(item.fromNode, item.fromSlot);
+        const to = item.virtual ? mediaPortPos(item.toNode) : inputPos(item.toNode, mediaInputIndex(item.toNode));
+        const off = Boolean(badgesFor(cache, item.toNode).get(Number(item.fromNode?.id))?.off);
+        strokeLink(ctx, from, to, off, style);
+    }
+}
+
+/** 下游描边层：把「用到这张卡的 DN 组」圈出来。
+ *  判定压灰的口径与连线一致 —— 同一张卡在同一组里被过滤，线和圈一起变灰。 */
+function drawDownstreamRings(ctx) {
+    const cards = selectedCards();
+    if (!cards.length) return;
+    const { nodes, links } = collectDownstream(cards);
+    if (!nodes.size) return;
+    const offIds = new Set();
+    const cache = new Map();
+    for (const item of links) {
+        if (badgesFor(cache, item.toNode).get(Number(item.fromNode?.id))?.off) offIds.add(Number(item.toNode?.id));
+    }
+    ringNodes(ctx, nodes, offIds, { color: mediaLinkColor(), soft: withAlpha(mediaLinkColor(), SOFT_ALPHA) });
+}
+
+/** 覆盖画布绘制：连线层 + 前景层（节点描边）。两个方向各画一套。 */
 function patchCanvas() {
     const canvas = app.canvas;
     if (!canvas || canvas.__DnUpstreamHighlightPatched) return;
@@ -348,10 +510,12 @@ function patchCanvas() {
         const originalDraw = canvas.drawConnections;
         canvas.drawConnections = function (ctx) {
             const result = originalDraw.apply(this, arguments);
+            const target = ctx || this.bgctx || this.ctx;
             try {
-                drawLinkHighlight(ctx || this.bgctx || this.ctx);
+                drawLinkHighlight(target);
+                drawDownstreamLinks(target);
             } catch (error) {
-                console.warn("[DN upstream highlight] link layer failed:", error);
+                console.warn("[DN highlight] link layer failed:", error);
             }
             return result;
         };
@@ -361,16 +525,23 @@ function patchCanvas() {
         const originalForeground = canvas.onDrawForeground;
         canvas.onDrawForeground = function (ctx) {
             const result = originalForeground.apply(this, arguments);
+            const target = ctx || this.bgctx || this.ctx;
             try {
-                drawNodeRings(ctx || this.bgctx || this.ctx);
+                drawNodeRings(target);
+                drawDownstreamRings(target);
             } catch (error) {
-                console.warn("[DN upstream highlight] node layer failed:", error);
+                console.warn("[DN highlight] node layer failed:", error);
             }
             return result;
         };
     }
+    // 方向 A：选中 DN 组 → 上游资产卡（琥珀金）
     addForegroundPainter("dn.highlight.links", (ctx) => {
         drawLinkHighlight(ctx);
+    });
+    // 方向 B：选中资产卡 → 下游 DN 组（H3_MEDIA 连线色）
+    addForegroundPainter("dn.highlight.down.links", (ctx) => {
+        drawDownstreamLinks(ctx);
     });
     // 序号圆点：最高优先级 —— 必须画在金色高亮之上（详见 drawVirtualDots 的说明）
     addForegroundPainter("dn.highlight.dots", (ctx) => {

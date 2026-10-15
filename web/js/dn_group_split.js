@@ -9,7 +9,7 @@
  *      并把 `prompt` 口**固定在最后**（它不参与增删，连线不会掉）。
  *      没接上游时数量收敛成 0 —— 只有一个 prompt 口，不摆没有素材可拆的图片/音频口。
  *      已经**连出线**的口任何情况下都不删（删口会连带断掉用户下游的分支）。
- *   3. 上游是「资产卡 to Director Group」时，用 dn_prompt_rich 里**与后端同一条过滤规则**
+ *   3. 上游是「资产卡镜头打包」时，用 dn_prompt_rich 里**与后端同一条过滤规则**
  *      数出实际会进模型的图片 / 音频数量，自动写进数量控件。
  *
  * 自动更新靠什么触发（三条路，任意一条先到就先算）：
@@ -25,6 +25,16 @@
  * 探测失败**不静默**：点刷新按钮会把来龙去脉打到控制台（上游是哪个节点、卡在哪一步）。
  * 界面保持安静：状态字只有短的一截，**按钮上不背状态** —— 曾经把整串状态拼在按钮上，
  * 一长串糊在节点下边，比状态本身还显眼。
+ *
+ * 载入工作流时还有一件事必须做在前面：前端会把「定义里的输出口」和「存盘里的输出口」
+ * **按下标**缝在一起（`ComfyNode.configure` → `zip`，只有 name/type/shape/localized_name
+ * 以定义为准，**label 与 links 用存盘那份**）。本节点的定义只剩一个 `prompt` 口，
+ * 不先把定义侧对齐成存盘那份，存盘的 `image_1` 就会缝到 `prompt` 上 ——
+ * prompt 顶着 image_1 的标签（"图片 1"）、还接手了它的连线。
+ * 详见 `alignDefinitionOutputs`；这一步包在 `configure` 上，不是 `onConfigure` 上。
+ *
+ * 另一条铁律：**已连线的口绝不删**（删口会连带删线，不可逆）。载入时数量控件可能还没恢复、
+ * 上游可能一时探不到，任何按读数收敛的路径都要先拿"已连线口"兜底，见 `refresh` 里的 `guarded`。
  *
  * 为什么数量一定要走「控件」而不是前端自己存一份：
  *   数量控件是**前后端唯一的契约** —— 前端按它建口、后端按它切片。
@@ -59,10 +69,21 @@ const OUTPUT_TYPES = Object.freeze({ image: "IMAGE", video: "IMAGE", audio: "AUD
 
 /** 本扩展负责增删的口（其余一律不动，且永远排在最后）。 */
 const MANAGED_OUTPUT_RE = /^(?:image|video|audio)_\d+$/;
+/** 不参与增删的固定口（后端 PROMPT_OUTPUT_NAME），永远排在最后。 */
+const PROMPT_OUTPUT = "prompt";
+/** 固定口的显示名。**每次对账都写回** —— 存盘文件里可能留着一个错标签（见
+ *  alignDefinitionOutputs 的注释：前端按下标缝合时会把 image_1 的 label 缝到它身上）。
+ *  prompt（提示词）与 duration（时长，秒）都**不参与增删、永远排在最后两行**，
+ *  顺序为 提示词 → 时长（时长在最下边）。 */
+const FIXED_OUTPUT_LABELS = Object.freeze({ [PROMPT_OUTPUT]: "提示词", duration: "时长（秒）" });
 /** 上游「导演台 Group」这类打包节点的 ref_* 输入（用已连线条数当数量）。 */
 const PACKED_INPUT_RE = /^(?:ref_)?(image|video|audio)_\d+$/;
 /** 上游「Groups Combine」这类分组拼接节点的输入名：`groups` / `group_0` / `groups.group_0`。 */
 const GROUP_INPUT_RE = /^(?:groups|group_\d+|groups\.group_\d+)$/;
+/** 「资产卡任务台」：它会按「运行段」吐不同的段，各段素材数**不一定相同**。
+ *  它的分段口名正好也匹配上面的 GROUP_INPUT_RE，所以必须在探到它时**先拦下来**，
+ *  否则会静默地"按第 1 段的口数开拆分口" —— 跑素材数不同的段就错位。 */
+const DIRECTOR_CLASS = "DNGroupDirector";
 
 /** 手动刷新按钮（不参与序列化，只是给"自动更新没跟上"留一条明路）。 */
 const REFRESH_WIDGET = "dn_refresh_upstream";
@@ -175,10 +196,111 @@ function sourceLabel(node) {
     return `${nodeClassName(node) || "?"}#${node.id ?? "?"}`;
 }
 
-/** 上游是否"带提示词控件的分组节点"（`资产卡 to Director Group` 这类）。
+/** 上游是否"带提示词控件的分组节点"（`资产卡镜头打包` 这类）。
  *  用来判「它一张卡都没接 → 它现在产出的分组就是空的」。 */
 function hasPromptWidget(node) {
     return Boolean(getWidget(node, "prompt"));
+}
+
+/* ================================================================
+ * 1.5 输出口 ↔ 连线（**必须同时兼容新旧两种前端**）
+ *
+ * 老版 litegraph 把连线记在口自己身上（`slot.links` / `slot.link`）；
+ * 新版（本机 comfyui_frontend 1.53.x，重写过的 litegraph）把 `links` 从输出口
+ * 对象上**彻底去掉了**（`NodeOutputSlot` 只有 name / type / label …），连线只存在
+ * 图的拓扑表 `graph.links` 里，靠 `origin_id + origin_slot` 反查。
+ *
+ * 这是本文件最容易踩的坑，「重开工作流后连线错位到别的口上」就是它引起的：
+ * 旧实现只在「重排输出口之后」用 `slot.links` 去改连线，而新版前端上它恒为空
+ * → 输出口被重排、连线却原地不动 → 现场看到的就是连线整体串位。
+ * 所以下面取连线一律走这套函数，两种前端都取得到。
+ * ================================================================ */
+
+/** 图上所有连线（新旧前端的 graph.links 容器不一样：Map / 普通对象）。 */
+function allLinks(graph) {
+    const table = graph?.links;
+    if (!table) return [];
+    if (typeof table.values === "function") return [...table.values()];
+    return Object.values(table);
+}
+
+function linkIdOf(link) {
+    const id = link?.id;
+    return id == null ? null : id;
+}
+
+/** 某个输出口（按 slot 序号）上挂着的连线 id 列表。 */
+function outputLinkIds(node, index, output = node?.outputs?.[index]) {
+    const ids = [];
+    const push = (id) => {
+        if (id == null) return;
+        if (!ids.some((item) => String(item) === String(id))) ids.push(id);
+    };
+
+    // ① 口自己记的（老前端）：数组 / 单值
+    const own = output?.links;
+    if (Array.isArray(own)) own.forEach(push);
+    else if (own != null && typeof own !== "object" && typeof own !== "function") push(own);
+    if (output?.link != null) push(output.link);
+
+    // ② 图的拓扑表反查（新前端唯一可靠的来源）
+    for (const link of allLinks(node?.graph || app.graph)) {
+        if (String(link?.origin_id ?? link?.originId) !== String(node?.id)) continue;
+        if (Number(link?.origin_slot ?? link?.originSlot) !== Number(index)) continue;
+        push(linkIdOf(link));
+    }
+    return ids;
+}
+
+/** 按连线 id 取连线对象（新旧容器的取法都试一遍）。 */
+function getLink(node, id) {
+    const table = (node?.graph || app.graph)?.links;
+    if (!table || id == null) return null;
+    if (typeof table.get === "function") return table.get(id) ?? null;
+    return table[id] ?? null;
+}
+
+/** **重排输出口之前必须做的事**：按「旧的 slot 序号」给连线拍一张快照。
+ *
+ *  必须先拍快照、再改连线：连线一旦被改过，按序号就再也反查不到它原来挂在哪儿了。
+ *  两个前端各取一次（新前端只有 ②，老前端 ① 兜底），一次遍历，不按口重复扫图。 */
+function snapshotSlotLinks(node) {
+    const snapshot = new Map();
+    const push = (slot, id) => {
+        if (id == null || !Number.isInteger(slot) || slot < 0) return;
+        if (!snapshot.has(slot)) snapshot.set(slot, []);
+        if (!snapshot.get(slot).some((item) => String(item) === String(id))) snapshot.get(slot).push(id);
+    };
+
+    // ② 图的拓扑表（新前端的唯一来源）
+    for (const link of allLinks(node?.graph || app.graph)) {
+        if (String(link?.origin_id ?? link?.originId) !== String(node?.id)) continue;
+        push(Number(link?.origin_slot ?? link?.originSlot), linkIdOf(link));
+    }
+    // ① 口自己记的（老前端），只在口上真的有 links 时才补 —— 新前端这里是空跑
+    (node?.outputs || []).forEach((output, index) => {
+        const own = output?.links;
+        if (Array.isArray(own)) own.forEach((id) => push(index, id));
+        else if (own != null && typeof own !== "object") push(index, own);
+        if (output?.link != null) push(index, output.link);
+    });
+    return snapshot;
+}
+
+/** 把一条连线的出发点改到第 index 个口上。
+ *  新版 litegraph 的 `origin_slot` 是访问器，赋值会同步内部拓扑表，所以直接写就行。 */
+function setLinkOriginSlot(link, index) {
+    if (!link) return false;
+    let changed = false;
+    try {
+        if (Number(link.origin_slot) !== Number(index)) { link.origin_slot = index; changed = true; }
+        if ("originSlot" in link && link.originSlot !== index) { link.originSlot = index; changed = true; }
+        if ("from_slot" in link && link.from_slot !== index) { link.from_slot = index; changed = true; }
+        if ("fromSlot" in link && link.fromSlot !== index) { link.fromSlot = index; changed = true; }
+    } catch (error) {
+        console.warn("[DN group split] 修正连线出发点失败（连线可能显示错位）:", error);
+    }
+    return changed;
 }
 
 /** **已经连出线的素材口**：任何"按上游收敛"的操作都不许把它删掉。
@@ -190,16 +312,15 @@ function hasPromptWidget(node) {
  */
 function linkedPortCounts(node) {
     const counts = { image: 0, video: 0, audio: 0 };
-    for (const output of node?.outputs || []) {
-        const match = /^(image|video|audio)_(\d+)$/.exec(String(output?.name || ""));
-        if (!match) continue;
-        const links = Array.isArray(output.links)
-            ? output.links
-            : output?.link == null
-              ? []
-              : [output.link];
-        if (!links.length) continue;
+    const bump = (name) => {
+        const match = /^(image|video|audio)_(\d+)$/.exec(String(name || ""));
+        if (!match) return;
         counts[match[1]] = Math.max(counts[match[1]], Number(match[2]) || 0);
+    };
+    // 口自己记的线 + 图上拓扑表反查，由 snapshotSlotLinks 一次拿全（新旧前端都适用）
+    for (const [slot, ids] of snapshotSlotLinks(node)) {
+        if (!ids.length) continue;
+        bump(node?.outputs?.[slot]?.name);
     }
     return counts;
 }
@@ -261,6 +382,23 @@ function probeUpstream(node) {
         return { counts: null, mode: "idle", reason: "no-source", source: null };
     }
     const label = sourceLabel(source);
+
+    // ⓪ 上游是「资产卡任务台」：它按「运行段」吐不同的段，各段的素材数**不一定一样**。
+    //    这里能算出来的只是"接在第 1 个分段口上那一段"的素材数 —— 拿它当固定口数，
+    //    跑别的段就会错位。所以先拦下来：口数照给（不然比现在更糟），
+    //    但标题栏直接写「⚠ 上游是任务台」，让你去开「固定 9+3+3」。
+    if (nodeClassName(source) === DIRECTOR_CLASS) {
+        const inner = firstGroupSource(source);
+        const media = inner ? resolveMediaCounts(inner) : null;
+        return {
+            counts: media?.known
+                ? { image: media.image, video: media.video || 0, audio: media.audio }
+                : null,
+            mode: "director",
+            reason: "director-upstream",
+            source: label,
+        };
+    }
 
     // ① 卡片路径：只要上游能"展平出卡片"就按卡片数算。
     //    刻意**不**再用类名判断（`DNMediaToDirectorGroup` 一旦改名 / 被别的节点包一层，
@@ -353,6 +491,45 @@ function trimNodeDataOutputs(nodeData) {
     }
 }
 
+/**
+ * **载入工作流前的必要一步：把「节点定义侧的输出口」对齐成存盘那份（同名、同序、同长）。**
+ *
+ * 前端载入时（ComfyUI `src/services/litegraphService.ts` → `ComfyNode.configure`）是这么缝的：
+ *
+ * ```js
+ * data.outputs = zip(this.outputs, data.outputs ?? []).map(([output, outputData]) =>
+ *     output ? { ...outputData, ...pick(output, ['name','type','shape','localized_name']) } : outputData)
+ * ```
+ *
+ * 也就是**按下标**把存盘数据缝到定义口上，而且只有 `name / type / shape / localized_name`
+ * 以定义为准，**`label` 和 `links` 一律用存盘那份**（`zip` 是 lodash 语义：按长的那个补齐）。
+ *
+ * 我们的定义里素材口被 `trimNodeDataOutputs` 剔掉了、只剩 `prompt` 一个，于是：
+ *   · 存盘的第 0 个口（`image_1`）被缝到 `prompt` 上 → prompt 拿走 image_1 的 `label`
+ *     （"图片 1"）**和它的连线**，真正的 `image_1` 口不复存在；
+ *   · 存盘里剩下的口（image_2/3、audio_1/2）整段错位；
+ *   · 之后本扩展再按控件数收敛时，错位出来的口没有线、有线的那条挂在 prompt 上 ——
+ *     现场就是「重开工作流后提示词口显示成图片 1、连线跑到最下边一行 / 断掉」。
+ *
+ * 对齐之后，缝合就是**恒等操作**（四个保留字段本来就是它自己的值），一个口都不会串。
+ * 只动口数以内的布局，不碰 `data`（存盘那份原样交给前端）。
+ */
+function alignDefinitionOutputs(node, info) {
+    const saved = Array.isArray(info?.outputs) ? info.outputs : null;
+    if (!saved?.length) return;                       // 老工作流没存 outputs：交给按数量重建
+    node.outputs = saved.map((entry) => {
+        const name = String(entry?.name || "");
+        const managed = MANAGED_OUTPUT_RE.test(name);
+        return {
+            name,
+            type: managed ? outputType(name) : String(entry?.type || "*"),
+            shape: entry?.shape,
+            localized_name: entry?.localized_name ?? (managed ? outputLabel(name) : name),
+            links: [],
+        };
+    });
+}
+
 function desiredOutputNames(counts) {
     const names = [];
     for (const group of COUNT_GROUPS) {
@@ -376,38 +553,57 @@ function outputType(name) {
 }
 
 function removeOutputAt(node, index) {
-    const output = node?.outputs?.[index];
-    const graph = node?.graph || app.graph;
-    const links = Array.isArray(output?.links)
-        ? [...output.links]
-        : output?.link == null
-          ? []
-          : [output.link];
-    if (typeof node.removeOutput === "function") {
+    // 新版 litegraph 的 removeOutput 自带善后：先 disconnectOutput 断掉挂在这一口上的线，
+    // 再把后面各口的 origin_slot 依次减一。所以能调它就一定调它，别自己拼。
+    if (typeof node?.removeOutput === "function") {
         node.removeOutput(index);
         return;
     }
-    if (graph?.removeLink) for (const linkId of links) graph.removeLink(linkId);
+    const graph = node?.graph || app.graph;
+    const snapshot = snapshotSlotLinks(node);          // 删之前拍快照
+    for (const id of snapshot.get(index) || []) {
+        if (typeof graph?.removeLink === "function") graph.removeLink(id);
+        else if (typeof graph?.links?.delete === "function") graph.links.delete(id);
+        else if (graph?.links) delete graph.links[id];
+    }
     node.outputs?.splice(index, 1);
+    // 自己补上新版 removeOutput 的善后：被删口之后各口的连线依次前移一位
+    for (const [slot, ids] of snapshot) {
+        if (slot <= index) continue;
+        for (const id of ids) setLinkOriginSlot(getLink(node, id), slot - 1);
+    }
 }
 
-/** 口的顺序变了 → 把挂在口上的连线的 origin_slot 跟着改，连线就不会「跳槽」。 */
+/** **重排输出口之前**：把每个口上挂的连线改到它的新序号上，连线就不会「跳槽」。
+ *
+ *  用法固定为「先 reflowLinks(node, 新顺序)，再改写 node.outputs」：
+ *  函数内部会先按旧序号拍快照，所以它必须在数组被改动之前调用。
+ *
+ *  这是修「重开工作流后连线错位」的关键一步 —— 旧实现改连线用的是 `slot.links`，
+ *  在新版前端上恒为空，等于什么都没做。 */
+function reflowLinks(node, nextOrder) {
+    if (!Array.isArray(node?.outputs) || !Array.isArray(nextOrder)) return 0;
+    const snapshot = snapshotSlotLinks(node);           // 旧序号 → 连线 id
+    const nextIndex = new Map();
+    nextOrder.forEach((output, index) => nextIndex.set(output, index));
+    let moved = 0;
+    node.outputs.forEach((output, oldIndex) => {
+        const target = nextIndex.get(output);
+        if (target === undefined || target === oldIndex) return;
+        for (const id of snapshot.get(oldIndex) || []) {
+            if (setLinkOriginSlot(getLink(node, id), target)) moved += 1;
+        }
+    });
+    return moved;
+}
+
+/** 兜底：按各口**当前**的数组位置把连线的 origin_slot 再锚定一次（幂等）。
+ *  对已经是正确位置的连线不做改动，只用于防止个别前端把 origin_slot 落回旧值。 */
 function updateLinkTargets(node) {
-    const graph = node?.graph || app.graph;
-    if (!graph || !Array.isArray(node?.outputs)) return;
+    if (!Array.isArray(node?.outputs)) return;
     node.outputs.forEach((output, index) => {
-        const links = Array.isArray(output?.links)
-            ? output.links
-            : output?.link == null
-              ? []
-              : [output.link];
-        for (const linkId of links) {
-            const link = graph.links?.get?.(linkId) ?? graph.links?.[linkId];
-            if (!link) continue;
-            link.origin_slot = index;
-            if ("originSlot" in link) link.originSlot = index;
-            if ("from_slot" in link) link.from_slot = index;
-            if ("fromSlot" in link) link.fromSlot = index;
+        for (const id of outputLinkIds(node, index, output)) {
+            setLinkOriginSlot(getLink(node, id), index);
         }
     });
 }
@@ -461,7 +657,17 @@ function syncOutputs(node, counts) {
     for (const output of node.outputs || []) {
         const name = String(output?.name || "");
         if (!MANAGED_OUTPUT_RE.test(name)) {
-            rest.push(output); // prompt 口：不动、永远排最后
+            // 固定口（prompt）：不动位置、永远排最后；只把**显示名归位**。
+            // 为什么每次都要写：前端载入时按**下标**把存盘数据缝到定义口上，
+            // 存盘文件里的 prompt 口可能带着 image_1 的 label（详见 alignDefinitionOutputs），
+            // 不主动改回来就会一直显示「图片 1」。写回后下次存盘文件也干净了。
+            const fixed = FIXED_OUTPUT_LABELS[name];
+            if (fixed && (output.label !== fixed || output.localized_name !== fixed)) {
+                output.label = fixed;
+                output.localized_name = fixed;
+                changed = true;
+            }
+            rest.push(output);
             continue;
         }
         if (!wantedSet.has(name)) continue;
@@ -478,6 +684,9 @@ function syncOutputs(node, counts) {
         sorted.some((output, index) => output !== node.outputs[index]);
     if (changed || reordered) {
         node.outputs ||= [];
+        // 顺序要紧：**先按旧序号把连线的 origin_slot 改到新序号，再改写数组**。
+        // 反过来做就是「重排了口、线却没跟着走」——那就是连线错位的来源。
+        reflowLinks(node, sorted);
         node.outputs.splice(0, node.outputs.length, ...sorted);
         updateLinkTargets(node);
     }
@@ -544,11 +753,16 @@ const MODE_TAG = {
     packed: "（按已连线口）",
     passthrough: "（隔了中转节点）",
     empty: "（空分组）",
+    director: "（任务台：只算第 1 段）",
     manual: "（手动）",
 };
 /** "no-source" 只出现在**手动刷新时的控制台日志**里 —— 没接线是正常状态，
  *  界面上走 idle，一个字都不显示（see probeUpstream / statusShort）。 */
-const REASON_TEXT = { "no-source": "group 输入没接线", "no-cards": "上游不是资产卡节点" };
+const REASON_TEXT = {
+    "no-source": "group 输入没接线",
+    "no-cards": "上游不是资产卡节点",
+    "director-upstream": "上游是「资产卡任务台」——口数请改用「固定 9+3+3」",
+};
 
 /** 画在节点标题栏里的短状态（空间小，只留最要紧的）。
  *  idle（还没接线）返回空串 → drawStatus 直接不画：刚拖出来的节点干干净净。
@@ -561,6 +775,8 @@ function statusShort(status) {
     if (!status || status.mode === "idle") return "";
     if (status.mode === "none") return "⚠ 未识别上游";
     if (status.mode === "fix") return "固定 9+3+3";
+    // 导演台上游：口数只能按第 1 段算，必须自己开固定口 —— 亮 ⚠，别让它当成正常数
+    if (status.mode === "director") return "⚠ 上游是任务台";
     const mark = status.stale || status.filtered === false ? " ⚠" : "";
     return statusCountsText(status.counts) + mark;
 }
@@ -576,6 +792,10 @@ function statusLong(status) {
         return why ? `未识别上游 · ${why}` : "未识别上游";
     }
     if (status.mode === "fix") return "固定 9+3+3";
+    if (status.mode === "director") {
+        return statusCountsText(status.counts) + "（任务台：只能按第 1 段算）"
+            + " · 请打开「固定 9+3+3」—— 各段素材数不一样，口数不固定住跑别的段就会错位";
+    }
     let text = statusCountsText(status.counts) + (MODE_TAG[status.mode] || "");
     if (status.filtered === false) text += " · 提示词读不到，按全部卡片算";
     if (status.stale) text += " · 已连线的口保留（上游当前给不出这么多）";
@@ -606,7 +826,7 @@ function reportManual(node, status, probed) {
         console.warn("[DN group split] 手动刷新：认不出上游，数量由你在控件里指定。", {
             ...detail,
             卡在哪一步: REASON_TEXT[status.reason] || status.reason,
-            认得出的上游: "「资产卡 to Director Group」的输出、官方 ref_* 逐口节点、"
+            认得出的上游: "「资产卡镜头打包」的输出、官方 ref_* 逐口节点、"
                 + "Groups Combine（只算第一个分组）、以及穿过单输入中转节点后的卡片节点。",
         });
         return;
@@ -635,6 +855,8 @@ function reportManual(node, status, probed) {
  */
 function refresh(node, options = {}) {
     if (!node || node.__dnSplitBusy) return false;
+    // **载入工作流期间一律不动输出口**（见 releaseAfterLoad 的注释）。
+    if (node.__dnSplitLoading) return false;
     node.__dnSplitBusy = true;
     try {
         let status = null;
@@ -690,7 +912,23 @@ function refresh(node, options = {}) {
         }
 
         const counts = readCounts(node);
-        const layoutChanged = syncOutputs(node, counts);
+        // **已连线的口绝不删**（这条不变式必须覆盖每一条对账路径，不只是自动探测那条）：
+        // 载入时控件可能还没恢复（读到 0）、上游可能一时探不到，只要按读数收敛，
+        // 挂在线上的口就会被删掉、连线跟着没 —— 那是不可逆的。
+        // 口数必须与控件、与后端切片三者一致，所以控件要跟着抬到「已连线口」那么多：
+        // 宁可让手改的值当着用户的面弹回来（看得见），也不要静默删掉一条线（看不见）。
+        const guarded = mergeKeepLinked(counts, keep);
+        if (guarded.bumped) {
+            applyCounts(node, guarded.counts);
+            if (node.__dnSplitManual) {
+                console.info(
+                    "[DN group split] 数量没能改小：有连线挂在被砍掉的口上，已连线的口不删。"
+                    + "（要先断开那些连线，数量才能降下来）",
+                    { 读到: counts, 实际采用: guarded.counts }
+                );
+            }
+        }
+        const layoutChanged = syncOutputs(node, guarded.counts);
         const changed = layoutChanged || Boolean(options.force);
         // 只有**口真的增删了**才收高度：单纯重绘不该把用户手动拉过的高度改掉
         if (layoutChanged) resizeToContent(node);
@@ -819,6 +1057,31 @@ function drawStatus(node, ctx) {
     ctx.restore();
 }
 
+/** 载入工作流这一轮结束 → 解除「载入期禁改输出口」，并对一次账。
+ *
+ *  为什么载入期必须禁改口：`configure` 是**逐节点**跑的，而图上的连线是在整图
+ *  configure 里、**节点之后**才注册的。载入中途按 widget 值重算输出口，
+ *  轻则读到还没落位的默认值（把 9+3+3 收敛成 1+0+1，误删有连线的口），
+ *  重则撞上「连线还没注册」而断开用户的下游分支 ——
+ *  现场就是「重开工作流后输出口的连线错位 / 串到别的口上」。
+ *
+ *  放行时机取本轮的宏任务末尾：那时连线已注册、widget 值也已恢复，
+ *  这一次 refresh 只会做「读控件 → 对齐输出口 → 画状态字」，是自洽的。
+ *  新建节点（不是载入）时 __dnSplitLoading 从未置位，这里直接空转。 */
+function releaseAfterLoad(node) {
+    const release = () => {
+        if (!node?.__dnSplitLoading) return;
+        node.__dnSplitLoading = false;
+        try {
+            refresh(node, { resync: false });
+        } catch (error) {
+            console.warn("[DN group split] 载入后对账失败（输出口保持工作流里的原样）:", error);
+        }
+    };
+    setTimeout(release, 0);
+    setTimeout(release, 300);   // 兜底：个别前端把整图 configure 拆到多个宏任务里
+}
+
 function installNode(nodeType, nodeData) {
     if (nodeData?.name !== NODE_CLASS) return;
     trimNodeDataOutputs(nodeData);
@@ -845,7 +1108,28 @@ function installNode(nodeType, nodeData) {
             this.__dnSplitApplied = countsKey(readCounts(this));
         }
         setup(this);
-        refresh(this, { resync: false, force: true });
+        // 载入期（configure 还在跑）**不动输出口**：这时图上的连线可能还没注册、
+        // widget 值也未必已落位，任何"按数量重建"都可能误删有连线的口。
+        // 真正的对账交给 releaseAfterLoad()（本轮 configure 结束后）和其后的轻扫描。
+        if (!this.__dnSplitLoading) refresh(this, { resync: false, force: true });
+        return result;
+    };
+
+    /** **必须包在 `configure` 本身上，不能只包 `onConfigure`**：
+     *  前端把「定义口」和「存盘口」按下标缝合（`ComfyNode.configure` → zip）发生在
+     *  `LGraphNode.configure` 内部、`onConfigure` 之前 —— 等到 onConfigure 再动手，
+     *  缝错的现场已经发生（prompt 已经拿到 image_1 的 label 和连线）。
+     *  这里在缝合前把定义侧的口对齐成存盘那份，缝合即恒等。 */
+    const originalConfigureSelf = nodeType.prototype.configure;
+    nodeType.prototype.configure = function configureDnGroupSplit(info) {
+        this.__dnSplitLoading = true;
+        try {
+            alignDefinitionOutputs(this, info);
+        } catch (error) {
+            console.warn("[DN group split] 载入前对齐输出口失败（改回按数量重建）:", error);
+        }
+        const result = originalConfigureSelf?.apply(this, arguments);
+        releaseAfterLoad(this);
         return result;
     };
 
