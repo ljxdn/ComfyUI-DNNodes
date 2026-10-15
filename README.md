@@ -333,6 +333,22 @@ ComfyUI-DNNodes/
 
 ## 更新日志
 
+- **v1.7.8**（2026-10-15）
+  - 修「**升采样长时间卡住 / 突然慢几十倍**」（SelfLift Sampler DN 的「高分辨率提升」）。
+    症状：同一段升采样平时 11 秒，某些时候变 650 秒，甚至彻底卡死 ——
+    日志停在 `Model LatentResizer3D prepared for dynamic VRAM loading` 之后再无输出，
+    任务管理器里 **GPU 占用 100% 但功耗只有 80W、温度 40℃**（看着满载其实没在算），
+    整个系统发卡。用 `py-spy` 抓栈可以看到进程根本没在算，而是停在
+    cuBLASLt 的 dynamic-shader 初始化里等驱动锁。
+    原因：这一步要的是**空闲**显存，而 ComfyUI 的动态 VRAM 管理层在显存吃紧时
+    不会主动卸载已常驻的大模型（日志里的 `0 models unloaded.`）。典型现场是
+    文本编码器（qwen3vl_32b，约 25.8 GiB）还常驻在 32 GiB 显存上，升采样开始时
+    只剩 0.5 GiB 空闲 —— 权重只能在「显存 ↔ 主机缓冲」之间反复倒腾，吞吐直接崩。
+    修法：`selflift_cache.py` 里升采样前先读**真实**空闲显存
+    （`torch.cuda.mem_get_info`，ComfyUI 自己的 `get_free_memory` 在动态模式下会高估），
+    低于估算值 ×1.15 就 `unload_all_models()` + `soft_empty_cache()` 腾干净再升采样。
+    升采样跑完下游会按需重新加载模型，代价远小于 650 秒的空转。
+    （`*.py` 改动**需要重启一次 ComfyUI** 才生效。）
 - **v1.7.7**（2026-10-15）
   - 节点**改名**：「资产卡导演台」→ **「资产卡任务台」**。
     **只改界面显示名**，`DNGroupDirector` 节点 id、`web/js/dn_director.js`、

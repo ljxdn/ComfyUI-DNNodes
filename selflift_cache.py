@@ -203,6 +203,45 @@ def _comfy_mod(name: str):
 # ---------------------------------------------------------------------------
 
 
+#: 腾显存时的余量系数：估算值 × 这个系数 当作「必须空出多少」。
+VRAM_HEADROOM_SLACK = 1.15
+
+
+def _ensure_vram_headroom(mm, torch, device, memory_required):
+    """升采样前先腾出真·空闲显存（2026-10-15）。
+
+    这一步要的是**空闲**显存：全分辨率激活（1×512×52×68×120 fp32 级别）会同时占用
+    好几份，估算值 6.6 GiB 只是其中最大那一份的 8 倍系数。而 ComfyUI 的动态 VRAM
+    管理层在显存吃紧时不会主动卸载已常驻的大模型——日志里那句 `0 models unloaded.`
+    就是这个意思。典型现场：文本编码器（qwen3vl_32b，约 25.8 GiB）还常驻在 32 GiB
+    显存里，升采样开始时只剩 0.5 GiB 空闲。这时权重只能在「显存 ↔ 主机缓冲」之间
+    来回倒腾，实测同一段升采样从 11 秒劣化到 648 秒，甚至彻底卡在驱动调用里不出来
+    （nvidia-smi 显示 GPU 100% 占用但只有 80W / 40℃，看着像满载其实没在算）。
+
+    所以这里用 `torch.cuda.mem_get_info` 读**真实**空闲显存（ComfyUI 自己的
+    get_free_memory 在动态模式下会高估），不够就强制卸载其他模型再升采样。
+    """
+    need = int(memory_required * VRAM_HEADROOM_SLACK)
+    try:
+        free_b, total_b = torch.cuda.mem_get_info(device)
+    except Exception as err:  # 读不到就按老路子走，别把节点搞崩
+        logging.warning("[DNSSelfLiftH3 upscaler] 读不到真实空闲显存，跳过腾显存：%s", err)
+        return
+    if free_b >= need:
+        return
+    logging.info("[DNSSelfLiftH3 upscaler] 空闲显存 %.2f GiB (共 %.2f) < 需要 %.2f GiB，"
+                 "先卸载其他模型再升采样",
+                 free_b / 2**30, total_b / 2**30, need / 2**30)
+    mm.unload_all_models()
+    mm.soft_empty_cache()
+    try:
+        free_after, _ = torch.cuda.mem_get_info(device)
+        logging.info("[DNSSelfLiftH3 upscaler] 卸载后空闲显存 %.2f GiB",
+                     free_after / 2**30)
+    except Exception:
+        pass
+
+
 def _learned_lift(z0_low, out_hw, model_name, chunking, force_unload):
     import torch
     import comfy.model_management
@@ -229,6 +268,7 @@ def _learned_lift(z0_low, out_hw, model_name, chunking, force_unload):
                  "开" if chunking else "关", chunk, overlap, z0_low.shape[2],
                  memory_required / 2**20)
     try:
+        _ensure_vram_headroom(comfy.model_management, torch, device, memory_required)
         comfy.model_management.load_models_gpu([patcher], memory_required=memory_required)
         dtype = model.conv_in.weight.dtype
         mean = torch.tensor(ups.LATENTS_MEAN, dtype=dtype, device=device).view(1, -1, 1, 1, 1)

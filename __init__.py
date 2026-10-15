@@ -55,7 +55,7 @@ except Exception as _sl_err:  # 缺依赖时静默降级，不影响其它 DN �
 NODE_CLASS_MAPPINGS = {**_CARD_NODES, **_GROUP_NODES, **_SELFLIFT_NODES}
 NODE_DISPLAY_NAME_MAPPINGS = {**_CARD_NAMES, **_GROUP_NAMES, **_SELFLIFT_NAMES}
 
-__version__ = "1.7.7"
+__version__ = "1.7.8"
 
 # 前端扩展目录（ComfyUI 会把这里的每个 js 都加载一遍）：
 #   asset_card.js           资产卡节点的自绘 UI
