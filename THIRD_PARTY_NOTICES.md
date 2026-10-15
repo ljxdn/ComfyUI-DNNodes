@@ -61,7 +61,7 @@ SOFTWARE.
 |---|---|
 | 仓库 | `https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director` |
 | 许可 | Apache License 2.0（`Copyright 2026 ComfyUI-Bernini Contributors`） |
-| 关系 | 本包的 `资产卡 to Director Group` 节点**输出**导演台所需的分组字典（类型 `MMX_DIR_GROUP`），其字段结构对齐该项目的 `pack_r2v_group`；`web/js/dn_continuity_guard.js` 针对该项目 `web/js/minimax_timeline.js` 的重建逻辑做了前端补丁（不修改其源码） |
+| 关系 | 本包的 `资产卡镜头打包` 节点**输出**导演台所需的分组字典（类型 `MMX_DIR_GROUP`），其字段结构对齐该项目的 `pack_r2v_group`；`web/js/dn_continuity_guard.js` 针对该项目 `web/js/minimax_timeline.js` 的重建逻辑做了前端补丁（不修改其源码） |
 | 是否复制代码 | **未复制**。仅为数据格式兼容与互操作，属于接口对接。 |
 
 该项目的完整许可证见其仓库根目录 `LICENSE`。
